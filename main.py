@@ -297,7 +297,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
         },
 
         # Entry-Expiration (damit Limit nicht ewig hängt)
-        "entry_expiration": { "time": 60 }  # 60 Min Default; gerne via ENV nachrüsten
+        "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }  # z. B. 60 min via ENV
     }
 
     # Runner-Hinweis:
