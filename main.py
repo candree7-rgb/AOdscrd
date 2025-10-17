@@ -2,52 +2,51 @@
 # -*- coding: utf-8 -*-
 
 """
-Discord → Altrady Forwarder (New-Format + Thread Follow)
-- Liest die jüngsten Nachrichten im Parent-Channel (z.B. 15 Stück)
-- Wenn ein Post nur den Thread eröffnet (kein Signaltext), folgt er dem Thread
-  und versucht dort die letzten Beiträge (z.B. 5) zu parsen
-- Erkennt Format:
+Discord → Altrady Forwarder (New-Format: Enter/TP1..3/DCA1..3, Markdown-safe)
+- Holt die neueste Discord-Message (content + embed.description)
+- Ignoriert Markdown-Formatierungen (**fett**, _kursiv_) beim Parsen
+- Erwartetes Format, z. B.:
+    VELVET SHORT Signal
+    VELVET on ByBit (Conditional Trigger)
+    VELVET on MEXC (Trigger Limit)
 
-    <TICKER> (LONG/SHORT) Signal
-    ...
-    Enter on Trigger: $X.XXXX
-    TP1: $...
-    TP2: $...
-    TP3: $...
-    DCA #1: $...
-    DCA #2: $...
-    DCA #3: $...
+    Enter on Trigger: $0.20000
 
-- Rechnet absolute Preise in %-Abstände vom Entry um (für Altrady price_percentage)
-- Baut Altrady "open" Payload mit:
-    order_type=limit, signal_price=Entry
-    leverage=25 (env)
-    dca_orders: 150% / 225% / 340% (env)
-    take_profit: 30/30/30 (env), Runner 10% via trailing stop (stop_loss)
-    optionaler harter SL in % jenseits DCA3 (env)
-- Schickt Payload an ALTRADY_WEBHOOK_URL
+    TP1: $0.19830
+    TP2: $0.19670
+    TP3: $0.19190
+
+    DCA #1: $0.21000
+    DCA #2: $0.23000
+    DCA #3: $0.27000
+- Rechnet absolute Preise in %-Abstände vom Entry (für Altrady price_percentage)
+- Baut Altrady "open" Payload:
+    • order_type=limit, signal_price=Entry
+    • leverage (fixed per ENV)
+    • dca_orders (Größen aus ENV)
+    • take_profit (TP1/2/3-Splits aus ENV)
+    • positionsweiter Stop mit optionalem Hard SL + Trailing (Runner)
+    • entry_expiration (Minuten per ENV)
 """
 
 import os, re, sys, time, json, traceback
 from datetime import datetime
 from pathlib import Path
-
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # =========================
-# ENV
+# ENVs
 # =========================
-
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # Bybit: BYBI, MEXC: MEXC, etc.
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
@@ -69,13 +68,9 @@ DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
 ENTRY_EXPIRATION_MIN = int(os.getenv("ENTRY_EXPIRATION_MIN", "60"))
 
-# Polling + history sizes
-POLL_BASE_SECONDS    = int(os.getenv("POLL_BASE_SECONDS", "60"))
-POLL_OFFSET_SECONDS  = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
-PARENT_FETCH_LIMIT   = int(os.getenv("PARENT_FETCH_LIMIT", "15"))
-THREAD_FETCH_LIMIT   = int(os.getenv("THREAD_FETCH_LIMIT", "5"))
-
-STATE_FILE           = Path(os.getenv("STATE_FILE", "state.json"))
+POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
+POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
+STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
 
 # =========================
 # Sanity
@@ -85,20 +80,17 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    "Authorization": DISCORD_TOKEN,     # User session token or bot token
+    "Authorization": DISCORD_TOKEN,
     "User-Agent": "DiscordToAltrady-DCA/1.1"
 }
 
 # =========================
 # Helpers
 # =========================
-
 def load_state() -> dict:
     if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception: pass
     return {"last_id": None}
 
 def save_state(st: dict):
@@ -114,57 +106,54 @@ def sleep_until_next_tick():
         next_tick = period_start + POLL_OFFSET_SECONDS
     time.sleep(max(0, next_tick - now))
 
-# =========================
-# Discord fetch
-# =========================
-
-def fetch_messages(channel_id: str, limit: int = 15):
+def fetch_latest_message(channel_id: str):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
+    r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
     if r.status_code == 429:
         retry = 5
         try: retry = float(r.json().get("retry_after", 5))
         except Exception: pass
         time.sleep(retry + 0.5)
-        r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
+        r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
     r.raise_for_status()
-    return r.json()  # newest first
-
-def fetch_thread_messages(thread_channel_id: str, limit: int = 5):
-    # Threads sind eigene Channel-IDs – gleiche endpoint
-    return fetch_messages(thread_channel_id, limit=limit)
+    data = r.json()
+    return data[0] if data else None
 
 # =========================
-# Parsing (neues Format)
+# Parsing (Markdown-safe)
 # =========================
+# Regex robust für:
+#  - **VELVET** SHORT Signal
+#  - _Enter on Trigger:_ $0.20000
+#  - TP1: **$0.19830**
+PAIR_LINE   = re.compile(r"^\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal", re.I | re.M)
+ENTER_LINE  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+TP1_LINE    = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+TP2_LINE    = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+TP3_LINE    = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+DCA1_LINE   = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+DCA2_LINE   = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+DCA3_LINE   = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 
-PAIR_LINE   = re.compile(r"\b([A-Z0-9]{2,})\s+(LONG|SHORT)\s+Signal\b", re.I)
-ENTER_LINE  = re.compile(r"Enter\s+on\s+Trigger:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP1_LINE    = re.compile(r"TP1:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP2_LINE    = re.compile(r"TP2:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP3_LINE    = re.compile(r"TP3:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA1_LINE   = re.compile(r"DCA\s*#?1:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA2_LINE   = re.compile(r"DCA\s*#?2:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA3_LINE   = re.compile(r"DCA\s*#?3:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+def _clean_markdown(s: str) -> str:
+    if not s: return ""
+    # Entferne **, __, *, _, Backticks und exotische geschützte Leerzeichen
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[*_`]+", "", s)
+    # Discord bold kann auch **$0.12345** sein → nach obigem schon sauber
+    return s
 
-THREAD_URL  = re.compile(r"https?://discord\.com/channels/\d+/(\d+)/\d+", re.I)
-
-def _collect_text_from_message(msg: dict) -> str:
+def _source_text(msg: dict) -> str:
     parts = []
-    parts.append((msg.get("content") or ""))
+    content = (msg.get("content") or "")
+    parts.append(content)
     embeds = msg.get("embeds") or []
     if embeds and isinstance(embeds, list):
         e0 = embeds[0] or {}
         desc = e0.get("description") or ""
         if desc: parts.append(desc)
-        # Einige Bots packen Felder in embed.fields
-        fields = e0.get("fields") or []
-        for f in fields:
-            name = (f.get("name") or "")
-            val  = (f.get("value") or "")
-            if name: parts.append(str(name))
-            if val:  parts.append(str(val))
-    return "\n".join([p for p in parts if p]).strip()
+    raw = "\n".join([p for p in parts if p]).strip()
+    return _clean_markdown(raw)
 
 def parse_new_signal_block(text: str):
     t = (text or "").replace("\r","").strip()
@@ -172,7 +161,7 @@ def parse_new_signal_block(text: str):
     if not m_pair:
         return None
     base  = m_pair.group(1).upper()
-    side  = "long" if m_pair.group(2).upper()=="LONG" else "short"
+    side  = "long" if m_pair.group(2).upper() == "LONG" else "short"
 
     m_e   = ENTER_LINE.search(t)
     m_tp1 = TP1_LINE.search(t)
@@ -181,7 +170,6 @@ def parse_new_signal_block(text: str):
     m_d1  = DCA1_LINE.search(t)
     m_d2  = DCA2_LINE.search(t)
     m_d3  = DCA3_LINE.search(t)
-
     if not (m_e and m_tp1 and m_tp2 and m_tp3 and m_d1 and m_d2 and m_d3):
         return None
 
@@ -200,58 +188,34 @@ def parse_new_signal_block(text: str):
     if not ok:
         return None
 
-    return {
-        "base": base,
-        "side": side,
-        "entry": entry,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "dca1": d1, "dca2": d2, "dca3": d3
-    }
+    return {"base":base,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"tp3":tp3,"dca1":d1,"dca2":d2,"dca3":d3}
 
-def try_parse_message(msg: dict):
-    text = _collect_text_from_message(msg)
-    if not text:
-        return None
-    # Split grob in Abschnitte und suche ersten Treffer
-    blocks = re.split(r"\n\s*\n", text)
+def extract_first_valid(msg: dict):
+    raw = _source_text(msg)
+    # Blöcke grob trennen (leere Zeile als Trenner)
+    blocks = re.split(r"\n\s*\n", raw)
     for b in blocks:
-        parsed = parse_new_signal_block(b)
-        if parsed:
-            return parsed
-    return None
-
-def find_thread_id(msg: dict) -> str | None:
-    # 1) native thread object?
-    thr = msg.get("thread")
-    if isinstance(thr, dict) and thr.get("id"):
-        return str(thr["id"])
-    # 2) link im text/embed
-    text = _collect_text_from_message(msg)
-    m = THREAD_URL.search(text)
-    if m:
-        return m.group(1)
+        p = parse_new_signal_block(b)
+        if p: return p
+    # Debug preview
+    print(f"[RAW PREVIEW] {raw[:1800]}")
     return None
 
 # =========================
-# Altrady Payload Builder
+# Altrady Payload
 # =========================
-
 def pct_dist(entry: float, price: float) -> float:
     return abs((price - entry) / entry) * 100.0
 
 def build_altrady_open_payload(sig: dict) -> dict:
-    base   = sig["base"]
-    side   = sig["side"]
-    entry  = sig["entry"]
-    tp1    = sig["tp1"]; tp2 = sig["tp2"]; tp3 = sig["tp3"]
-    d1     = sig["dca1"]; d2 = sig["dca2"]; d3 = sig["dca3"]
-
+    base, side = sig["base"], sig["side"]
+    entry, tp1, tp2, tp3 = sig["entry"], sig["tp1"], sig["tp2"], sig["tp3"]
+    d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
     tp1_pct = pct_dist(entry, tp1)
     tp2_pct = pct_dist(entry, tp2)
     tp3_pct = pct_dist(entry, tp3)
-
     dca1_pct = pct_dist(entry, d1)
     dca2_pct = pct_dist(entry, d2)
     dca3_pct = pct_dist(entry, d3)
@@ -270,40 +234,32 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "api_secret": ALTRADY_API_SECRET,
         "exchange": ALTRADY_EXCHANGE,
         "symbol": symbol,
-        "side": side,                        # "long" | "short"
+        "side": side,
         "order_type": "limit",
         "signal_price": float(f"{entry:.10f}"),
         "leverage": FIXED_LEVERAGE,
-
         "dca_orders": [
             {"price_percentage": float(f"{dca1_pct:.6f}"), "quantity_percentage": DCA1_QTY_PCT},
             {"price_percentage": float(f"{dca2_pct:.6f}"), "quantity_percentage": DCA2_QTY_PCT},
             {"price_percentage": float(f"{dca3_pct:.6f}"), "quantity_percentage": DCA3_QTY_PCT},
         ],
-
         "take_profit": [
             {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
             {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
-            {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
+            {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT},
         ],
-
         "stop_loss": {
             **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {}),
             "protection_type": "PRICE",
             "trailing_percentage": TRAILING_PERCENTAGE,
             "trailing_distance":  TRAILING_DISTANCE
         },
-
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
 
     if abs((TP1_PCT + TP2_PCT + TP3_PCT + RUNNER_PCT) - 100.0) > 1e-6:
         print("⚠️ Hinweis: TP1+TP2+TP3+RUNNER != 100%. Prüfe deine ENV-Splits.")
     return payload
-
-# =========================
-# Sender
-# =========================
 
 def post_to_altrady(payload: dict):
     for attempt in range(3):
@@ -313,8 +269,7 @@ def post_to_altrady(payload: dict):
                 delay = 2.0
                 try: delay = float(r.json().get("retry_after", 2.0))
                 except Exception: pass
-                time.sleep(delay + 0.25)
-                continue
+                time.sleep(delay + 0.25); continue
             r.raise_for_status()
             return r
         except Exception:
@@ -324,63 +279,33 @@ def post_to_altrady(payload: dict):
 # =========================
 # MAIN LOOP
 # =========================
-
 def main():
-    print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% split {TP1_PCT}/{TP2_PCT}/{TP3_PCT}+{RUNNER_PCT}(runner)")
-    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% / dist {TRAILING_DISTANCE}% | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (+{SL_BUFFER_PCT}% von DCA3)")
+    print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT}+{RUNNER_PCT}")
+    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (+{SL_BUFFER_PCT}% von DCA3) | Entry Exp: {ENTRY_EXPIRATION_MIN}m")
     state = load_state()
     last_id = state.get("last_id")
 
     while True:
         try:
-            msgs = fetch_messages(CHANNEL_ID, limit=PARENT_FETCH_LIMIT)  # newest first
-            # Filter: nur wirklich neue Nachrichten > last_id
-            new_msgs = []
-            if last_id is None:
-                new_msgs = msgs[:]
+            msg = fetch_latest_message(CHANNEL_ID)
+            if not msg:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Kanal leer.")
             else:
-                for m in msgs:
-                    try:
-                        if int(m["id"]) > int(last_id):
-                            new_msgs.append(m)
-                    except:
-                        new_msgs.append(m)
-
-            # in chronologischer Reihenfolge abarbeiten (alt -> neu)
-            for msg in reversed(new_msgs):
                 mid = msg.get("id")
-                raw_preview = (_collect_text_from_message(msg) or "")[:180].replace("\n"," ⏎ ")
-                parsed = try_parse_message(msg)
-                if not parsed:
-                    # Versuch: Thread folgen
-                    thr_id = find_thread_id(msg)
-                    if thr_id:
-                        try:
-                            tmsgs = fetch_thread_messages(thr_id, limit=THREAD_FETCH_LIMIT)
-                            # auch hier alt->neu
-                            for tmsg in reversed(tmsgs):
-                                parsed = try_parse_message(tmsg)
-                                if parsed:
-                                    break
-                        except Exception as e:
-                            print(f"⚠️ Thread-Fetch Fehler {thr_id}: {e}")
-
-                if not parsed:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal erkannt.")
-                    print(f"[RAW PREVIEW] {raw_preview}")
+                if last_id is None or int(mid) > int(last_id):
+                    parsed = extract_first_valid(msg)
+                    if not parsed:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal erkannt.")
+                    else:
+                        print(f"[PARSED] {parsed}")
+                        payload = build_altrady_open_payload(parsed)
+                        _ = post_to_altrady(payload)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {parsed['base']} {parsed['side']} @ {parsed['entry']}")
+                    last_id = mid
+                    state["last_id"] = last_id
+                    save_state(state)
                 else:
-                    print(f"[PARSED] {parsed}")
-                    payload = build_altrady_open_payload(parsed)
-                    _ = post_to_altrady(payload)
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {parsed['base']} {parsed['side']} @ {parsed['entry']}")
-                # update last_id nach jeder abgearbeiteten neuen Nachricht
-                last_id = mid
-                state["last_id"] = last_id
-                save_state(state)
-
-            if not new_msgs:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Keine neuere Nachricht.")
-
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Keine neuere Nachricht.")
         except KeyboardInterrupt:
             print("\nStopped."); break
         except requests.HTTPError as http_err:
@@ -389,8 +314,7 @@ def main():
             except Exception: pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except Exception:
-            print("[ERROR]")
-            traceback.print_exc()
+            print("[ERROR]"); traceback.print_exc()
 
         sleep_until_next_tick()
 
