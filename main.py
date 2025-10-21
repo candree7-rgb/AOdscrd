@@ -2,72 +2,85 @@
 # -*- coding: utf-8 -*-
 
 """
-Discord → Altrady Forwarder (New-Format: Enter/TP1..3/DCA1..3, Markdown-safe)
-- Holt die neueste Discord-Message (content + embed.description)
-- Ignoriert Markdown-Formatierungen (**fett**, _kursiv_) beim Parsen
-- Erwartetes Format, z. B.:
-    VELVET SHORT Signal
-    VELVET on ByBit (Conditional Trigger)
-    VELVET on MEXC (Trigger Limit)
+Discord → Altrady Forwarder (Enter/TP1..3/DCA1..3, robustes Parsing)
+- Liest die neueste Discord-Nachricht (content + embed.description)
+- Erfasst Signale im Format:
 
-    Enter on Trigger: $0.20000
+    <TICKER> LONG/SHORT Signal
+    <TICKER> on ByBit (Conditional Trigger)
+    <TICKER> on MEXC (Trigger Limit)
 
-    TP1: $0.19830
-    TP2: $0.19670
-    TP3: $0.19190
+    Enter on Trigger: $X.XXXX
+    TP1: $...
+    TP2: $...
+    TP3: $...
+    DCA #1: $...
+    DCA #2: $...
+    DCA #3: $...
 
-    DCA #1: $0.21000
-    DCA #2: $0.23000
-    DCA #3: $0.27000
+- Säubert Markdown (Links, **bold**, NBSP, etc.)
 - Rechnet absolute Preise in %-Abstände vom Entry (für Altrady price_percentage)
-- Baut Altrady "open" Payload:
-    • order_type=limit, signal_price=Entry
-    • leverage (fixed per ENV)
-    • dca_orders (Größen aus ENV)
-    • take_profit (TP1/2/3-Splits aus ENV)
-    • positionsweiter Stop mit optionalem Hard SL + Trailing (Runner)
-    • entry_expiration (Minuten per ENV)
+- Baut Altrady "open"-Payload:
+    • order_type = limit, signal_price = Entry
+    • leverage = FIXED_LEVERAGE (z. B. 25)
+    • dca_orders (Mengen laut ENV), price_percentage = Abstand vom Entry
+    • take_profit: TP1/TP2/TP3 (Splits via ENV)
+    • stop_loss: Trailing-Stop (Runner 10% durch trailing abgesichert)
+    • optionaler harter SL relativ zu DCA3 (via ENV)
+    • entry_expiration: aus ENV (z. B. 60 Min)
+- Sendet an ALTRADY_WEBHOOK_URL
 """
 
-import os, re, sys, time, json, traceback
+import os, re, sys, time, json, traceback, html
 from datetime import datetime
 from pathlib import Path
+
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # =========================
-# ENVs
+# ENV
 # =========================
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # Bybit: BYBI, MEXC: MEXC, etc.
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()   # Bybit: BYBI
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
+# Leverage (Strategie: 25x)
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
 
+# TP-Split (z. B. 30/30/30) + Runner (10%)
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
 TP2_PCT             = float(os.getenv("TP2_PCT", "30"))
 TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
 RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 
-TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))
-TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))
+# Trailing-Stop (für Runner / Restposition)
+TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))   # Abstand in %
+TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))     # Schrittweite in %
 
+# Optionaler harter SL relativ zu DCA3:
+# SHORT: SL = DCA3 * (1 + SL_BUFFER_PCT/100)
+# LONG : SL = DCA3 * (1 - SL_BUFFER_PCT/100)
 USE_HARD_SL         = os.getenv("USE_HARD_SL", "off").lower() == "on"
 SL_BUFFER_PCT       = float(os.getenv("SL_BUFFER_PCT", "5.0"))
 
+# DCA-Positionsgrößen (in % der Startgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
 DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "225"))
 DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
+# Limit-Order Ablaufzeit (Minuten)
 ENTRY_EXPIRATION_MIN = int(os.getenv("ENTRY_EXPIRATION_MIN", "60"))
 
+# Polling
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
@@ -80,17 +93,20 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     sys.exit(1)
 
 HEADERS = {
-    "Authorization": DISCORD_TOKEN,
+    "Authorization": DISCORD_TOKEN,     # User-Session oder Bot-Token
     "User-Agent": "DiscordToAltrady-DCA/1.1"
 }
 
 # =========================
 # Helpers
 # =========================
+
 def load_state() -> dict:
     if STATE_FILE.exists():
-        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception: pass
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     return {"last_id": None}
 
 def save_state(st: dict):
@@ -120,48 +136,48 @@ def fetch_latest_message(channel_id: str):
     return data[0] if data else None
 
 # =========================
-# Parsing (Markdown-safe)
+# Parsing (robust gegen Markdown)
 # =========================
-# Regex robust für:
-#  - **VELVET** SHORT Signal
-#  - _Enter on Trigger:_ $0.20000
-#  - TP1: **$0.19830**
-PAIR_LINE   = re.compile(r"^\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal", re.I | re.M)
-ENTER_LINE  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-TP1_LINE    = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-TP2_LINE    = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-TP3_LINE    = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-DCA1_LINE   = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-DCA2_LINE   = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-DCA3_LINE   = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 
-def _clean_markdown(s: str) -> str:
+# Markdown-Cleaner
+MD_LINK   = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")  # [text](url) -> text
+MD_MARK   = re.compile(r"[*_`~]+")                    # **bold**, _it_, `code`, ~~del~~
+MULTI_WS  = re.compile(r"[ \t\u00A0]+")               # inkl. NBSP
+
+def clean_markdown(s: str) -> str:
     if not s: return ""
-    # Entferne **, __, *, _, Backticks und exotische geschützte Leerzeichen
-    s = s.replace("\u00A0", " ")
-    s = re.sub(r"[*_`]+", "", s)
-    # Discord bold kann auch **$0.12345** sein → nach obigem schon sauber
-    return s
+    s = s.replace("\r", "")
+    s = html.unescape(s)
+    s = MD_LINK.sub(r"\1", s)
+    s = MD_MARK.sub("", s)
+    s = MULTI_WS.sub(" ", s)
+    s = "\n".join(line.strip() for line in s.split("\n"))
+    return s.strip()
 
-def _source_text(msg: dict) -> str:
-    parts = []
-    content = (msg.get("content") or "")
-    parts.append(content)
-    embeds = msg.get("embeds") or []
-    if embeds and isinstance(embeds, list):
-        e0 = embeds[0] or {}
-        desc = e0.get("description") or ""
-        if desc: parts.append(desc)
-    raw = "\n".join([p for p in parts if p]).strip()
-    return _clean_markdown(raw)
+# Tolerante Patterns
+PAIR_LINE   = re.compile(r"^\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*$", re.I | re.M)
+ENTER_LINE  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP1_LINE    = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP2_LINE    = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP3_LINE    = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA1_LINE   = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA2_LINE   = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA3_LINE   = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
 def parse_new_signal_block(text: str):
-    t = (text or "").replace("\r","").strip()
+    """
+    Gibt dict zurück oder None, wenn Format nicht passt.
+    """
+    t = clean_markdown(text)
+    if not t:
+        return None
+
     m_pair = PAIR_LINE.search(t)
     if not m_pair:
         return None
+
     base  = m_pair.group(1).upper()
-    side  = "long" if m_pair.group(2).upper() == "LONG" else "short"
+    side  = "long" if m_pair.group(2).upper()=="LONG" else "short"
 
     m_e   = ENTER_LINE.search(t)
     m_tp1 = TP1_LINE.search(t)
@@ -170,6 +186,7 @@ def parse_new_signal_block(text: str):
     m_d1  = DCA1_LINE.search(t)
     m_d2  = DCA2_LINE.search(t)
     m_d3  = DCA3_LINE.search(t)
+
     if not (m_e and m_tp1 and m_tp2 and m_tp3 and m_d1 and m_d2 and m_d3):
         return None
 
@@ -181,6 +198,7 @@ def parse_new_signal_block(text: str):
     d2    = float(m_d2.group(1))
     d3    = float(m_d3.group(1))
 
+    # Plausibilitäten
     if side == "long":
         ok = (tp1>entry and tp2>entry and tp3>entry and d1<entry and d2<entry and d3<entry)
     else:
@@ -188,38 +206,75 @@ def parse_new_signal_block(text: str):
     if not ok:
         return None
 
-    return {"base":base,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"tp3":tp3,"dca1":d1,"dca2":d2,"dca3":d3}
+    return {
+        "base": base,
+        "side": side,
+        "entry": entry,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "dca1": d1, "dca2": d2, "dca3": d3
+    }
 
-def extract_first_valid(msg: dict):
-    raw = _source_text(msg)
-    # Blöcke grob trennen (leere Zeile als Trenner)
+def extract_blocks(msg: dict):
+    """
+    Holt content + embed.description, säubert Markdown, splittet in Blöcke,
+    liefert den ersten passenden Parse.
+    """
+    parts = []
+    content = (msg.get("content") or "")
+    parts.append(content)
+    embeds = msg.get("embeds") or []
+    if embeds and isinstance(embeds, list):
+        e0 = embeds[0] or {}
+        desc = e0.get("description") or ""
+        if desc: parts.append(desc)
+
+    raw = "\n".join([p for p in parts if p]).strip()
+    raw = clean_markdown(raw)
+
+    # Für Debug: zeige die ersten Zeilen nach Cleaning
+    print("[RAW PREVIEW CLEANED]")
+    print("\n".join(raw.split("\n")[:30]))
+
+    # Blöcke grob trennen (>=1 Leerzeile)
     blocks = re.split(r"\n\s*\n", raw)
     for b in blocks:
-        p = parse_new_signal_block(b)
-        if p: return p
-    # Debug preview
-    print(f"[RAW PREVIEW] {raw[:1800]}")
+        parsed = parse_new_signal_block(b)
+        if parsed:
+            return parsed
     return None
 
 # =========================
-# Altrady Payload
+# Altrady Payload Builder
 # =========================
+
 def pct_dist(entry: float, price: float) -> float:
+    """Absolute Prozentdistanz vom Entry (positiv)."""
     return abs((price - entry) / entry) * 100.0
 
 def build_altrady_open_payload(sig: dict) -> dict:
-    base, side = sig["base"], sig["side"]
-    entry, tp1, tp2, tp3 = sig["entry"], sig["tp1"], sig["tp2"], sig["tp3"]
-    d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
+    """
+    Formt das geparste Signal in die Altrady 'open' Payload um.
+    - TP/DCA price_percentage relativ zum Entry
+    - SL: optional harter SL jenseits DCA3 + Trailing (Runner)
+    """
+    base   = sig["base"]
+    side   = sig["side"]
+    entry  = sig["entry"]
+    tp1    = sig["tp1"]; tp2 = sig["tp2"]; tp3 = sig["tp3"]
+    d1     = sig["dca1"]; d2 = sig["dca2"]; d3 = sig["dca3"]
+
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
+    # Prozentabstände
     tp1_pct = pct_dist(entry, tp1)
     tp2_pct = pct_dist(entry, tp2)
     tp3_pct = pct_dist(entry, tp3)
+
     dca1_pct = pct_dist(entry, d1)
     dca2_pct = pct_dist(entry, d2)
     dca3_pct = pct_dist(entry, d3)
 
+    # Optionaler harter SL
     stop_percentage = None
     if USE_HARD_SL:
         if side == "short":
@@ -234,32 +289,46 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "api_secret": ALTRADY_API_SECRET,
         "exchange": ALTRADY_EXCHANGE,
         "symbol": symbol,
-        "side": side,
+        "side": side,                        # "long" | "short"
         "order_type": "limit",
         "signal_price": float(f"{entry:.10f}"),
         "leverage": FIXED_LEVERAGE,
+
+        # DCA als Prozent (Richtung via 'side')
         "dca_orders": [
             {"price_percentage": float(f"{dca1_pct:.6f}"), "quantity_percentage": DCA1_QTY_PCT},
             {"price_percentage": float(f"{dca2_pct:.6f}"), "quantity_percentage": DCA2_QTY_PCT},
             {"price_percentage": float(f"{dca3_pct:.6f}"), "quantity_percentage": DCA3_QTY_PCT},
         ],
+
+        # 3 TPs (Splits via ENV)
         "take_profit": [
             {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
             {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
-            {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT},
+            {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
         ],
+
+        # Stop-Loss: Trailing + optional fester Stop
         "stop_loss": {
             **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {}),
             "protection_type": "PRICE",
             "trailing_percentage": TRAILING_PERCENTAGE,
             "trailing_distance":  TRAILING_DISTANCE
         },
+
+        # Entry-Expiration (Limit-Order läuft aus)
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
 
+    # Hinweis falls Splits nicht 100% ergeben
     if abs((TP1_PCT + TP2_PCT + TP3_PCT + RUNNER_PCT) - 100.0) > 1e-6:
-        print("⚠️ Hinweis: TP1+TP2+TP3+RUNNER != 100%. Prüfe deine ENV-Splits.")
+        print("⚠️ Hinweis: TP1+TP2+TP3+RUNNER != 100%. Prüfe ENV-Splits.")
+
     return payload
+
+# =========================
+# Sender
+# =========================
 
 def post_to_altrady(payload: dict):
     for attempt in range(3):
@@ -269,7 +338,8 @@ def post_to_altrady(payload: dict):
                 delay = 2.0
                 try: delay = float(r.json().get("retry_after", 2.0))
                 except Exception: pass
-                time.sleep(delay + 0.25); continue
+                time.sleep(delay + 0.25)
+                continue
             r.raise_for_status()
             return r
         except Exception:
@@ -279,9 +349,11 @@ def post_to_altrady(payload: dict):
 # =========================
 # MAIN LOOP
 # =========================
+
 def main():
-    print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT}+{RUNNER_PCT}")
-    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (+{SL_BUFFER_PCT}% von DCA3) | Entry Exp: {ENTRY_EXPIRATION_MIN}m")
+    print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
+    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% von DCA3)")
+    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: base {POLL_BASE_SECONDS}s + offset {POLL_OFFSET_SECONDS}s")
     state = load_state()
     last_id = state.get("last_id")
 
@@ -293,7 +365,7 @@ def main():
             else:
                 mid = msg.get("id")
                 if last_id is None or int(mid) > int(last_id):
-                    parsed = extract_first_valid(msg)
+                    parsed = extract_blocks(msg)
                     if not parsed:
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal erkannt.")
                     else:
@@ -314,7 +386,8 @@ def main():
             except Exception: pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except Exception:
-            print("[ERROR]"); traceback.print_exc()
+            print("[ERROR]")
+            traceback.print_exc()
 
         sleep_until_next_tick()
 
