@@ -14,7 +14,7 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBIF").strip()   # default to Bybit Futures
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBIF").strip()  # Bybit Futures
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
@@ -41,14 +41,16 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady-DCA/1.3"
+    "User-Agent": "DiscordToAltrady-DCA/1.3-fixed"
 }
 
 # ---------- utils ----------
 def load_state():
     if STATE_FILE.exists():
-        try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except: pass
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     return {"last_id": None}
 
 def save_state(st: dict):
@@ -69,8 +71,10 @@ def fetch_latest_message(channel_id: str):
     r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
     if r.status_code == 429:
         retry = 5
-        try: retry = float(r.json().get("retry_after", 5))
-        except: pass
+        try:
+            retry = float(r.json().get("retry_after", 5))
+        except Exception:
+            pass
         time.sleep(retry + 0.5)
         r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
     r.raise_for_status()
@@ -92,7 +96,7 @@ def clean_markdown(s: str) -> str:
     s = "\n".join(line.strip() for line in s.split("\n"))
     return s.strip()
 
-# ---------- tolerant regex (search in whole text) ----------
+# ---------- tolerant regex ----------
 PAIR_LINE   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
 ENTER_LINE  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 TP1_LINE    = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
@@ -103,8 +107,7 @@ DCA2_LINE   = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 DCA3_LINE   = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
 def parse_signal_from_message(msg: dict):
-    parts = []
-    parts.append(msg.get("content") or "")
+    parts = [msg.get("content") or ""]
     embeds = msg.get("embeds") or []
     if embeds and isinstance(embeds, list):
         e0 = embeds[0] or {}
@@ -119,7 +122,7 @@ def parse_signal_from_message(msg: dict):
     if not mp:
         return None
     base = mp.group(2).upper()
-    side = "long" if mp.group(3).upper()=="LONG" else "short"
+    side = "long" if mp.group(3).upper() == "LONG" else "short"
 
     me  = ENTER_LINE.search(raw)
     mt1 = TP1_LINE.search(raw)
@@ -163,10 +166,19 @@ def build_altrady_open_payload(sig: dict) -> dict:
     dca2_pct = pct_dist(entry, d2)
     dca3_pct = pct_dist(entry, d3)
 
-    stop_percentage = None
+    # stop_loss dict separat bauen (kein **-Unpacking)
+    stop_loss = {
+        "protection_type": "PRICE",
+        "trailing_percentage": TRAILING_PERCENTAGE,
+        "trailing_distance":  TRAILING_DISTANCE
+    }
     if USE_HARD_SL:
-        sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0) if sig["side"]=="short" else d3 * (1.0 - SL_BUFFER_PCT/100.0)
+        if side == "short":
+            sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0)
+        else:
+            sl_price = d3 * (1.0 - SL_BUFFER_PCT/100.0)
         stop_percentage = pct_dist(entry, sl_price)
+        stop_loss["stop_percentage"] = float(f"{stop_percentage:.6f}")
 
     payload = {
         "action": "open",
@@ -174,27 +186,22 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "api_secret": ALTRADY_API_SECRET,
         "exchange": ALTRADY_EXCHANGE,
         "symbol": symbol,
-        "side": sig["side"],
+        "side": side,
         "order_type": "limit",
         "signal_price": float(f"{entry:.10f}"),
         "leverage": FIXED_LEVERAGE,
         "dca_orders": [
             {"price_percentage": float(f"{dca1_pct:.6f}"), "quantity_percentage": DCA1_QTY_PCT},
             {"price_percentage": float(f"{dca2_pct:.6f}"), "quantity_percentage": DCA2_QTY_PCT},
-            {"price_percentage": float(f"{dca3_pct:.6f}"), "quantity_percentage": DCA3_QTY_PCT},
+            {"price_percentage": float(f"{dca3_pct:.6f}"), "quantity_percentage": DCA3_QTY_PCT}
         ],
         "take_profit": [
             {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
             {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
             {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
         ],
-        "stop_loss": {
-            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {}),
-            "protection_type": "PRICE",
-            "trailing_percentage": TRAILING_PERCENTAGE,
-            "trailing_distance":  TRAILING_DISTANCE
-        ],
-        "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
+        "stop_loss": stop_loss,
+        "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
     }
 
     if abs((TP1_PCT + TP2_PCT + TP3_PCT + RUNNER_PCT) - 100.0) > 1e-6:
@@ -205,13 +212,12 @@ def build_altrady_open_payload(sig: dict) -> dict:
 def _looks_like_lev_cap_error(text: str) -> bool:
     if not text: return False
     t = text.lower()
-    # match typical Altrady/Bybit messages
     keys = [
         "leverage invalid",
         "invalid leverage",
         "buy leverage invalid",
         "sell leverage invalid",
-        "code: 10001",   # seen in Bybit errors via Altrady
+        "code: 10001",
         "leverage not allowed"
     ]
     return any(k in t for k in keys)
@@ -221,13 +227,15 @@ def post_to_altrady(payload: dict):
     Send once with configured leverage.
     If the response indicates a leverage cap error and leverage > 20,
     retry exactly once with leverage=20.
-    Still preserves 429 backoff behaviour.
     """
-    body_text = ""
+    last_status = None
+    last_text = ""
     for attempt in range(3):
         try:
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
-            body_text = r.text
+            last_status = r.status_code
+            last_text   = r.text
+
             if r.status_code == 429:
                 delay = 2.0
                 try:
@@ -241,26 +249,24 @@ def post_to_altrady(payload: dict):
             if r.ok:
                 return r
 
-            # leverage cap fallback (one-shot)
-            if attempt == 0 and payload.get("leverage", 25) > 20 and _looks_like_lev_cap_error(body_text):
+            if attempt == 0 and payload.get("leverage", 25) > 20 and _looks_like_lev_cap_error(last_text):
                 print("↩︎ Retry with leverage=20 due to exchange cap…")
                 payload = dict(payload)
                 payload["leverage"] = 20
                 time.sleep(0.4)
                 continue
 
-            # not recoverable -> raise HTTPError to outer handler
             r.raise_for_status()
             return r
 
         except requests.HTTPError:
-            # bubble up after last attempt
             if attempt == 2:
-                print(f"[HTTP ERROR] {r.status_code} {body_text[:200] if body_text else ''}")
+                print(f"[HTTP ERROR] {last_status} {last_text[:200]}")
                 raise
             time.sleep(1.5 * (attempt + 1))
         except Exception:
-            if attempt == 2: raise
+            if attempt == 2:
+                raise
             time.sleep(1.5 * (attempt + 1))
 
 # ---------- main ----------
@@ -268,7 +274,8 @@ def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
     print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
     print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s")
-    state = load_state(); last_id = state.get("last_id")
+    state = load_state()
+    last_id = state.get("last_id")
 
     while True:
         try:
@@ -286,18 +293,24 @@ def main():
                         payload = build_altrady_open_payload(sig)
                         post_to_altrady(payload)
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
-                    last_id = mid; state["last_id"]=last_id; save_state(state)
+                    last_id = mid
+                    state["last_id"] = last_id
+                    save_state(state)
                 else:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] Keine neuere Nachricht.")
         except KeyboardInterrupt:
-            print("\nStopped."); break
+            print("\nStopped.")
+            break
         except requests.HTTPError as http_err:
             body = ""
-            try: body = http_err.response.text[:200]
-            except: pass
+            try:
+                body = http_err.response.text[:200]
+            except Exception:
+                pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except Exception:
-            print("[ERROR]"); traceback.print_exc()
+            print("[ERROR]")
+            traceback.print_exc()
         sleep_until_next_tick()
 
 if __name__ == "__main__":
