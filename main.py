@@ -14,7 +14,7 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBIF").strip()   # default to Bybit Futures
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
@@ -41,7 +41,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady-DCA/1.2"
+    "User-Agent": "DiscordToAltrady-DCA/1.3"
 }
 
 # ---------- utils ----------
@@ -165,7 +165,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
 
     stop_percentage = None
     if USE_HARD_SL:
-        sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0) if side=="short" else d3 * (1.0 - SL_BUFFER_PCT/100.0)
+        sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0) if sig["side"]=="short" else d3 * (1.0 - SL_BUFFER_PCT/100.0)
         stop_percentage = pct_dist(entry, sl_price)
 
     payload = {
@@ -174,7 +174,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "api_secret": ALTRADY_API_SECRET,
         "exchange": ALTRADY_EXCHANGE,
         "symbol": symbol,
-        "side": side,
+        "side": sig["side"],
         "order_type": "limit",
         "signal_price": float(f"{entry:.10f}"),
         "leverage": FIXED_LEVERAGE,
@@ -193,7 +193,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
             "protection_type": "PRICE",
             "trailing_percentage": TRAILING_PERCENTAGE,
             "trailing_distance":  TRAILING_DISTANCE
-        },
+        ],
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
 
@@ -201,18 +201,64 @@ def build_altrady_open_payload(sig: dict) -> dict:
         print("⚠️ Hinweis: TP1+TP2+TP3+RUNNER != 100%. Prüfe ENV-Splits.")
     return payload
 
+# ---------- sender with 20x fallback ----------
+def _looks_like_lev_cap_error(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    # match typical Altrady/Bybit messages
+    keys = [
+        "leverage invalid",
+        "invalid leverage",
+        "buy leverage invalid",
+        "sell leverage invalid",
+        "code: 10001",   # seen in Bybit errors via Altrady
+        "leverage not allowed"
+    ]
+    return any(k in t for k in keys)
+
 def post_to_altrady(payload: dict):
+    """
+    Send once with configured leverage.
+    If the response indicates a leverage cap error and leverage > 20,
+    retry exactly once with leverage=20.
+    Still preserves 429 backoff behaviour.
+    """
+    body_text = ""
     for attempt in range(3):
         try:
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
+            body_text = r.text
             if r.status_code == 429:
                 delay = 2.0
-                try: delay = float(r.json().get("retry_after", 2.0))
-                except: pass
+                try:
+                    j = r.json()
+                    delay = float(j.get("retry_after", 2.0))
+                except Exception:
+                    pass
                 time.sleep(delay + 0.25)
                 continue
+
+            if r.ok:
+                return r
+
+            # leverage cap fallback (one-shot)
+            if attempt == 0 and payload.get("leverage", 25) > 20 and _looks_like_lev_cap_error(body_text):
+                print("↩︎ Retry with leverage=20 due to exchange cap…")
+                payload = dict(payload)
+                payload["leverage"] = 20
+                time.sleep(0.4)
+                continue
+
+            # not recoverable -> raise HTTPError to outer handler
             r.raise_for_status()
             return r
+
+        except requests.HTTPError:
+            # bubble up after last attempt
+            if attempt == 2:
+                print(f"[HTTP ERROR] {r.status_code} {body_text[:200] if body_text else ''}")
+                raise
+            time.sleep(1.5 * (attempt + 1))
         except Exception:
             if attempt == 2: raise
             time.sleep(1.5 * (attempt + 1))
