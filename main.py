@@ -18,35 +18,27 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # z.B. BYBI (Bybit), BYBIF (Bybit Futures), MEXC, ...
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # BYBIF für Bybit Futures, MEXC, ...
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
-# Hebel (Basis 25x; Fallback etc. bewusst NICHT drin in dieser Version)
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
-
-# TP-Split (30/30/30) + Runner (10% über trailing SL abgesichert)
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
 TP2_PCT             = float(os.getenv("TP2_PCT", "30"))
 TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
 RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 
-# Trailing-Stop (positionsweiter Stop für den verbleibenden Runner)
-TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))   # %
-TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))     # %
+TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))
+TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))
 
-# Optionaler harter SL relativ zu DCA3
 USE_HARD_SL         = os.getenv("USE_HARD_SL", "off").lower() == "on"
-SL_BUFFER_PCT       = float(os.getenv("SL_BUFFER_PCT", "5.0"))         # 5% hinter DCA3
+SL_BUFFER_PCT       = float(os.getenv("SL_BUFFER_PCT", "5.0"))
 
-# DCA-Sizes gemäß Strategie (als % der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
 DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "225"))
 DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
-# Limit-Order Ablauf (Minuten)
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "60"))
 
-# Poll-Steuerung + Jitter
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
@@ -62,7 +54,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.3"
+    "User-Agent": "DiscordToAltrady-DCA/1.4"
 }
 
 # =========================
@@ -95,8 +87,10 @@ def fetch_latest_message(channel_id: str):
     r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
     if r.status_code == 429:
         retry = 5
-        try: retry = float(r.json().get("retry_after", 5))
-        except: pass
+        try:
+            retry = float(r.json().get("retry_after", 5))
+        except:
+            pass
         time.sleep(retry + 0.5)
         r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
     r.raise_for_status()
@@ -104,7 +98,7 @@ def fetch_latest_message(channel_id: str):
     return data[0] if data else None
 
 # =========================
-# Cleaning (Markdown -> Plain)
+# Cleaning (Markdown/HTML -> Plain)
 # =========================
 MD_LINK   = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")
 MD_MARK   = re.compile(r"[*_`~]+")
@@ -117,36 +111,74 @@ def clean_markdown(s: str) -> str:
     s = MD_LINK.sub(r"\1", s)     # [text](url) -> text
     s = MD_MARK.sub("", s)        # *, _, `, ~ entfernen
     s = MULTI_WS.sub(" ", s)      # mehrfachen Whitespace normalisieren
+    # Emojis stören nicht, wir lassen sie drin.
     s = "\n".join(line.strip() for line in s.split("\n"))
     return s.strip()
 
 # =========================
-# Parsing (tolerant, ganzes Textfeld)
+# Regex (tolerant, alle Varianten)
 # =========================
-# Beispiel:
-# TICKER SHORT Signal
-# TICKER on ByBit (Conditional Trigger)
-# TICKER on MEXC (Trigger Limit)
-# Enter on Trigger: $0.5600
-# TP1: $...
-# TP2: $...
-# TP3: $...
-# DCA #1: $...
-# DCA #2: $...
-# DCA #3: $...
+# A) Altes Format: "DIA SHORT Signal"
+PAIR_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
 
-PAIR_LINE   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
-ENTER_LINE  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP1_LINE    = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP2_LINE    = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP3_LINE    = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA1_LINE   = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA2_LINE   = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA3_LINE   = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+# B) Live Trade Signal: "PUFFER/USDT SHORT …"
+PAIR_SLASH = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s*/\s*(USDT|USDC)\s+(LONG|SHORT)\b", re.I)
+
+# C) APP-Format: "Coin: SD" + "Direction: SHORT"
+COIN_LINE  = re.compile(r"(^|\n)\s*Coin\s*:\s*([A-Z0-9]+)\b", re.I)
+DIR_LINE   = re.compile(r"(^|\n)\s*Direction\s*:\s*(LONG|SHORT)\b", re.I)
+
+# Entry: mehrere Varianten
+ENTER_TRIGGER  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+ENTRY_COLON    = re.compile(r"(^|\n)\s*Entry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)\b", re.I)
+ENTRY_BLOCK    = re.compile(r"(^|\n)\s*ENTRY\s*$\s*^\s*\$?\s*([0-9]*\.?[0-9]+)\b", re.I | re.M)
+
+# TPs (mit oder ohne Status-Emojis)
+TP1_LINE       = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP2_LINE       = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP3_LINE       = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+
+# DCA (mit # optional, Emojis egal)
+DCA1_LINE      = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA2_LINE      = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA3_LINE      = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+
+def find_base_side(raw: str):
+    # Priorität: Slash-Format, dann alt, dann APP-Format
+    m = PAIR_SLASH.search(raw)
+    if m:
+        base = m.group(2).upper()
+        side = "long" if m.group(4).upper()=="LONG" else "short"
+        return base, side
+    m = PAIR_OLD.search(raw)
+    if m:
+        base = m.group(2).upper()
+        side = "long" if m.group(3).upper()=="LONG" else "short"
+        return base, side
+    m_coin = COIN_LINE.search(raw)
+    m_dir  = DIR_LINE.search(raw)
+    if m_coin and m_dir:
+        base = m_coin.group(2).upper()
+        side = "long" if m_dir.group(2).upper()=="LONG" else "short"
+        return base, side
+    return None, None
+
+def find_entry(raw: str):
+    m = ENTER_TRIGGER.search(raw)
+    if m:
+        return float(m.group(1))
+    m = ENTRY_COLON.search(raw)
+    if m:
+        return float(m.group(2))
+    m = ENTRY_BLOCK.search(raw)
+    if m:
+        return float(m.group(2))
+    # Fallback: in manchen „Live Trade Signal“ Blöcken steht "ENTRY" und direkt darunter die Zahl
+    # Das deckt ENTRY_BLOCK ab; mehr brauchen wir i.d.R. nicht.
+    return None
 
 def parse_signal_from_message(msg: dict):
-    parts = []
-    parts.append(msg.get("content") or "")
+    parts = [msg.get("content") or ""]
     embeds = msg.get("embeds") or []
     if embeds and isinstance(embeds, list):
         e0 = embeds[0] or {}
@@ -155,28 +187,27 @@ def parse_signal_from_message(msg: dict):
 
     raw = clean_markdown("\n".join([p for p in parts if p]))
     print("[RAW PREVIEW CLEANED]")
-    print("\n".join(raw.split("\n")[:40]))
+    print("\n".join(raw.split("\n")[:60]))
 
-    mp = PAIR_LINE.search(raw)
-    if not mp:
+    base, side = find_base_side(raw)
+    if not base or not side:
         return None
-    base = mp.group(2).upper()
-    side = "long" if mp.group(3).upper()=="LONG" else "short"
 
-    me  = ENTER_LINE.search(raw)
+    entry = find_entry(raw)
     mt1 = TP1_LINE.search(raw)
     mt2 = TP2_LINE.search(raw)
     mt3 = TP3_LINE.search(raw)
     md1 = DCA1_LINE.search(raw)
     md2 = DCA2_LINE.search(raw)
     md3 = DCA3_LINE.search(raw)
-    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
+
+    if entry is None or not all([mt1, mt2, mt3, md1, md2, md3]):
         return None
 
-    entry = float(me.group(1))
-    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
-    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
+    tp1 = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
+    d1  = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
 
+    # Plausibilität
     if side == "long":
         ok = (tp1>entry and tp2>entry and tp3>entry and d1<entry and d2<entry and d3<entry)
     else:
@@ -195,8 +226,8 @@ def pct_dist(entry: float, price: float) -> float:
 
 def build_altrady_open_payload(sig: dict) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
-    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
-    d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
+    tp1, tp2, tp3     = sig["tp1"], sig["tp2"], sig["tp3"]
+    d1, d2, d3        = sig["dca1"], sig["dca2"], sig["dca3"]
 
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
@@ -258,8 +289,10 @@ def post_to_altrady(payload: dict):
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
             if r.status_code == 429:
                 delay = 2.0
-                try: delay = float(r.json().get("retry_after", 2.0))
-                except: pass
+                try:
+                    delay = float(r.json().get("retry_after", 2.0))
+                except:
+                    pass
                 time.sleep(delay + 0.25)
                 continue
             r.raise_for_status()
@@ -304,14 +337,15 @@ def main():
             break
         except requests.HTTPError as http_err:
             body = ""
-            try: body = http_err.response.text[:200]
-            except: pass
+            try:
+                body = http_err.response.text[:200]
+            except:
+                pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except Exception:
             print("[ERROR]")
             traceback.print_exc()
         finally:
-            # Immer schlafen – verhindert 1s-Spam, selbst bei Exceptions
             sleep_until_next_tick()
 
 if __name__ == "__main__":
