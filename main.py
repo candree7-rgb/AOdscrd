@@ -18,7 +18,8 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # BYBIF für Bybit Futures, MEXC, ...
+# Achtung: BYBIF für Bybit Futures, BYBI für Bybit Spot/Futures je nach Altrady-Mapping
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBIF").strip()
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
@@ -39,11 +40,15 @@ DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "60"))
 
+# Poll-Steuerung + Jitter
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
 
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
+
+# Wie viele Discord-Nachrichten pro Tick prüfen?
+DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "20"))
 
 # =========================
 # Sanity
@@ -54,7 +59,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.4"
+    "User-Agent": "DiscordToAltrady-DCA/1.5"
 }
 
 # =========================
@@ -82,9 +87,9 @@ def sleep_until_next_tick():
     jitter = random.uniform(0, max(0, POLL_JITTER_MAX))
     time.sleep(max(0, next_tick - now + jitter))
 
-def fetch_latest_message(channel_id: str):
+def fetch_messages(channel_id: str, limit: int = 20):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
+    r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
     if r.status_code == 429:
         retry = 5
         try:
@@ -92,10 +97,9 @@ def fetch_latest_message(channel_id: str):
         except:
             pass
         time.sleep(retry + 0.5)
-        r = requests.get(url, headers=HEADERS, params={"limit":1}, timeout=15)
+        r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
     r.raise_for_status()
-    data = r.json()
-    return data[0] if data else None
+    return r.json() or []
 
 # =========================
 # Cleaning (Markdown/HTML -> Plain)
@@ -111,15 +115,37 @@ def clean_markdown(s: str) -> str:
     s = MD_LINK.sub(r"\1", s)     # [text](url) -> text
     s = MD_MARK.sub("", s)        # *, _, `, ~ entfernen
     s = MULTI_WS.sub(" ", s)      # mehrfachen Whitespace normalisieren
-    # Emojis stören nicht, wir lassen sie drin.
     s = "\n".join(line.strip() for line in s.split("\n"))
     return s.strip()
+
+def message_text(msg: dict) -> str:
+    parts = []
+    if msg.get("content"): parts.append(msg["content"])
+    embeds = msg.get("embeds") or []
+    for e in embeds:
+        # Titel + Beschreibung + Felder einsammeln
+        t = e.get("title") or ""
+        d = e.get("description") or ""
+        if t: parts.append(t)
+        if d: parts.append(d)
+        for fld in (e.get("fields") or []):
+            name = fld.get("name") or ""
+            val  = fld.get("value") or ""
+            if name: parts.append(name)
+            if val:  parts.append(val)
+        # footer / author reinnehmen falls Text
+        ft = (e.get("footer") or {}).get("text")
+        if ft: parts.append(ft)
+        au = (e.get("author") or {}).get("name")
+        if au: parts.append(au)
+    raw = clean_markdown("\n".join([p for p in parts if p]))
+    return raw
 
 # =========================
 # Regex (tolerant, alle Varianten)
 # =========================
 # A) Altes Format: "DIA SHORT Signal"
-PAIR_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
+PAIR_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\b", re.I)
 
 # B) Live Trade Signal: "PUFFER/USDT SHORT …"
 PAIR_SLASH = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s*/\s*(USDT|USDC)\s+(LONG|SHORT)\b", re.I)
@@ -128,23 +154,25 @@ PAIR_SLASH = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s*/\s*(USDT|USDC)\s+(LONG|SHORT)\
 COIN_LINE  = re.compile(r"(^|\n)\s*Coin\s*:\s*([A-Z0-9]+)\b", re.I)
 DIR_LINE   = re.compile(r"(^|\n)\s*Direction\s*:\s*(LONG|SHORT)\b", re.I)
 
+# D) Fallback: „NEW SIGNAL • SYMBOL • Entry“
+NEW_SIGNAL = re.compile(r"NEW\s+SIGNAL\s*•\s*([A-Z0-9]+)\s*•\s*Entry\b", re.I)
+
 # Entry: mehrere Varianten
 ENTER_TRIGGER  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-ENTRY_COLON    = re.compile(r"(^|\n)\s*Entry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)\b", re.I)
+ENTRY_COLON    = re.compile(r"(^|\n)\s*Entry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 ENTRY_BLOCK    = re.compile(r"(^|\n)\s*ENTRY\s*$\s*^\s*\$?\s*([0-9]*\.?[0-9]+)\b", re.I | re.M)
 
-# TPs (mit oder ohne Status-Emojis)
+# TPs (mit oder ohne Status-Emojis/HIT etc.)
 TP1_LINE       = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 TP2_LINE       = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 TP3_LINE       = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
-# DCA (mit # optional, Emojis egal)
+# DCA (mit # optional)
 DCA1_LINE      = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 DCA2_LINE      = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 DCA3_LINE      = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
 def find_base_side(raw: str):
-    # Priorität: Slash-Format, dann alt, dann APP-Format
     m = PAIR_SLASH.search(raw)
     if m:
         base = m.group(2).upper()
@@ -161,6 +189,15 @@ def find_base_side(raw: str):
         base = m_coin.group(2).upper()
         side = "long" if m_dir.group(2).upper()=="LONG" else "short"
         return base, side
+    # Fallback: NEW SIGNAL • SYMBOL • Entry  (Side fehlt -> aus Kontext ableiten? Nein: wir brauchen Side)
+    m_new = NEW_SIGNAL.search(raw)
+    if m_new:
+        base = m_new.group(1).upper()
+        # Side heuristisch aus Text herausziehen (SHORT/LONG irgendwo im Block)
+        side_m = re.search(r"\b(LONG|SHORT)\b", raw, re.I)
+        if side_m:
+            side = "long" if side_m.group(1).upper()=="LONG" else "short"
+            return base, side
     return None, None
 
 def find_entry(raw: str):
@@ -173,22 +210,9 @@ def find_entry(raw: str):
     m = ENTRY_BLOCK.search(raw)
     if m:
         return float(m.group(2))
-    # Fallback: in manchen „Live Trade Signal“ Blöcken steht "ENTRY" und direkt darunter die Zahl
-    # Das deckt ENTRY_BLOCK ab; mehr brauchen wir i.d.R. nicht.
     return None
 
-def parse_signal_from_message(msg: dict):
-    parts = [msg.get("content") or ""]
-    embeds = msg.get("embeds") or []
-    if embeds and isinstance(embeds, list):
-        e0 = embeds[0] or {}
-        desc = e0.get("description") or ""
-        if desc: parts.append(desc)
-
-    raw = clean_markdown("\n".join([p for p in parts if p]))
-    print("[RAW PREVIEW CLEANED]")
-    print("\n".join(raw.split("\n")[:60]))
-
+def parse_signal_from_text(raw: str):
     base, side = find_base_side(raw)
     if not base or not side:
         return None
@@ -213,7 +237,6 @@ def parse_signal_from_message(msg: dict):
     else:
         ok = (tp1<entry and tp2<entry and tp3<entry and d1>entry and d2>entry and d3>entry)
     if not ok:
-        print("⚠️ Plausibility failed (side/levels mismatch).")
         return None
 
     return {"base":base,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"tp3":tp3,"dca1":d1,"dca2":d2,"dca3":d3}
@@ -302,7 +325,7 @@ def post_to_altrady(payload: dict):
             time.sleep(1.5 * (attempt + 1))
 
 # =========================
-# Main
+# Main (scan last N, process first unseen valid)
 # =========================
 def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
@@ -313,25 +336,46 @@ def main():
 
     while True:
         try:
-            msg = fetch_latest_message(CHANNEL_ID)
-            if not msg:
+            msgs = fetch_messages(CHANNEL_ID, limit=DISCORD_FETCH_LIMIT)
+            if not msgs:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Kanal leer.")
             else:
-                mid = msg.get("id")
-                if last_id is None or int(mid) > int(last_id):
-                    sig = parse_signal_from_message(msg)
-                    if not sig:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal erkannt.")
-                    else:
+                # Discord liefert meist reverse-chronologisch; wir sortieren chronologisch
+                msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id", "0")))
+                processed_any = False
+                max_seen_id = int(last_id) if last_id else 0
+
+                for m in msgs_sorted:
+                    mid = int(m.get("id"))
+                    if last_id and mid <= int(last_id):
+                        continue  # bereits verarbeitet/älter
+
+                    raw = message_text(m)
+                    print("[RAW PREVIEW CLEANED]")
+                    print("\n".join(raw.split("\n")[:60]))
+
+                    sig = parse_signal_from_text(raw)
+                    if sig:
                         print(f"[PARSED] {sig}")
                         payload = build_altrady_open_payload(sig)
                         post_to_altrady(payload)
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
-                    last_id = mid
+                        processed_any = True
+                        # Wir verarbeiten pro Tick genau EIN Signal (neueste in Reihenfolge),
+                        # danach aktualisieren wir last_id bis zur höchsten gesehenen ID
+                        # und brechen die Schleife.
+                        max_seen_id = max(max_seen_id, mid)
+                        break
+                    max_seen_id = max(max_seen_id, mid)
+
+                # last_id auf höchste gesehene ID setzen (damit wir nichts doppelt anfassen)
+                if max_seen_id:
+                    last_id = str(max_seen_id)
                     state["last_id"] = last_id
                     save_state(state)
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Keine neuere Nachricht.")
+
+                if not processed_any:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Kein neues valides Signal in den letzten {DISCORD_FETCH_LIMIT} Nachrichten.")
         except KeyboardInterrupt:
             print("\nStopped.")
             break
