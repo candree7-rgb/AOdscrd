@@ -48,13 +48,24 @@ DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "25"))
 
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
 
+# Stop-Logik (neu):
+# STOP_MODE: FOLLOW_TP (empfohlen) oder PRICE
+STOP_MODE           = os.getenv("STOP_MODE", "FOLLOW_TP").strip().upper()
+# Ab welchem TP auf Break-Even springen (1 = TP1)
+BE_AFTER_TP_INDEX   = int(os.getenv("BE_AFTER_TP_INDEX", "1"))
+# Ab welchem TP Trailing aktiv werden soll (2 = ab TP2)
+TRAIL_FROM_TP_INDEX = int(os.getenv("TRAIL_FROM_TP_INDEX", "2"))
+
+# =========================
+# Sanity
+# =========================
 if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     print("Bitte ENV setzen: DISCORD_TOKEN, CHANNEL_ID, ALTRADY_WEBHOOK_URL (+ Keys).")
     sys.exit(1)
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.4"
+    "User-Agent": "DiscordToAltrady-DCA/1.5"
 }
 
 # =========================
@@ -98,10 +109,6 @@ def fetch_messages_any(channel_id: str, limit: int = 25):
     return r.json() or []
 
 def message_text(m: dict) -> str:
-    """
-    Zieht content + alle Embeds (title, description, fields, footer) zusammen
-    -> damit wir auch APP/Live-Signal-Formate erwischen.
-    """
     parts = []
     parts.append(m.get("content") or "")
     embeds = m.get("embeds") or []
@@ -134,9 +141,9 @@ def clean_markdown(s: str) -> str:
     if not s: return ""
     s = s.replace("\r", "")
     s = html.unescape(s)
-    s = MD_LINK.sub(r"\1", s)     # [text](url) -> text
-    s = MD_MARK.sub("", s)        # *, _, `, ~ entfernen
-    s = MULTI_WS.sub(" ", s)      # mehrfachen Whitespace normalisieren
+    s = MD_LINK.sub(r"\1", s)
+    s = MD_MARK.sub("", s)
+    s = MULTI_WS.sub(" ", s)
     s = "\n".join(line.strip() for line in s.split("\n"))
     return s.strip()
 
@@ -194,7 +201,6 @@ def parse_from_header_slash(txt: str):
     base = mh.group(1).upper()
     side = "long" if mh.group(2).upper()=="LONG" else "short"
 
-    # Entry entweder als "Entry: $..." ODER in der ENTRY-Sektion
     me = re.search(r"\bEntry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", txt, re.I)
     if not me:
         me = ENTRY_SECTION.search(txt)
@@ -246,7 +252,6 @@ def build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3):
             "dca1":d1,"dca2":d2,"dca3":d3}
 
 def parse_signal_from_text(txt: str):
-    # Reihenfolge: alt -> Slash-Header -> Coin/Direction
     for fn in (parse_from_old_block, parse_from_header_slash, parse_from_coin_direction):
         sig = fn(txt)
         if sig: return sig
@@ -277,6 +282,27 @@ def build_altrady_open_payload(sig: dict) -> dict:
         sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0) if side=="short" else d3 * (1.0 - SL_BUFFER_PCT/100.0)
         stop_percentage = pct_dist(entry, sl_price)
 
+    # --- Stop-Block ---
+    if STOP_MODE == "FOLLOW_TP":
+        stop_loss_block = {
+            # Auto-BE nach TP1 (Index 1) und Trailing ab TP2 (Index 2)
+            "protection_type": "FOLLOW_TAKE_PROFIT",
+            "breakeven_at_take_profit_index": BE_AFTER_TP_INDEX,   # 1 => nach TP1
+            "trailing_from_take_profit_index": TRAIL_FROM_TP_INDEX, # 2 => ab TP2
+            "trailing_percentage": TRAILING_PERCENTAGE,
+            "trailing_distance":  TRAILING_DISTANCE,
+            # Optionaler harter Cap zusätzlich (falls gesetzt):
+            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {})
+        }
+    else:
+        # Fallback: klassischer Preis-/Trailing-Stop ohne TP-Kopplung
+        stop_loss_block = {
+            "protection_type": "PRICE",
+            "trailing_percentage": TRAILING_PERCENTAGE,
+            "trailing_distance":  TRAILING_DISTANCE,
+            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {})
+        }
+
     payload = {
         "action": "open",
         "api_key": ALTRADY_API_KEY,
@@ -300,12 +326,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
             {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
         ],
 
-        "stop_loss": {
-            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {}),
-            "protection_type": "PRICE",
-            "trailing_percentage": TRAILING_PERCENTAGE,
-            "trailing_distance":  TRAILING_DISTANCE
-        },
+        "stop_loss": stop_loss_block,
 
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
@@ -338,13 +359,13 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
-    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
+    print(f"   Stop-Mode: {STOP_MODE} | BE nach TP#{BE_AFTER_TP_INDEX} | Trailing ab TP#{TRAIL_FROM_TP_INDEX}")
+    print(f"   Trailing: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
     print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s) | Fetch last {DISCORD_FETCH_LIMIT}")
 
     state = load_state()
     last_id = state.get("last_id")
     if last_id is None:
-        # beim allerersten Start nicht uralte Messages abarbeiten
         try:
             latest = fetch_messages_any(CHANNEL_ID, limit=1)
             if latest:
@@ -359,7 +380,6 @@ def main():
             msgs = fetch_messages_any(CHANNEL_ID, limit=DISCORD_FETCH_LIMIT)
             msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
             max_seen_id = int(last_id or 0)
-            processed_any = False
 
             for m in msgs_sorted:
                 mid = int(m.get("id","0"))
@@ -380,13 +400,11 @@ def main():
                     payload = build_altrady_open_payload(sig)
                     post_to_altrady(payload)
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
-                    processed_any = True
                 else:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal in dieser Message.")
 
                 max_seen_id = max(max_seen_id, mid)
 
-            # nach Batch fortschreiben
             if max_seen_id > int(last_id or 0):
                 last_id = max_seen_id
                 state["last_id"] = str(last_id)
