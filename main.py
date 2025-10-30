@@ -18,11 +18,11 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-# Achtung: BYBIF für Bybit Futures, BYBI für Bybit Spot/Futures je nach Altrady-Mapping
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBIF").strip()
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # z.B. BYBI, BYBIF, MEXC
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
+
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
 TP2_PCT             = float(os.getenv("TP2_PCT", "30"))
 TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
@@ -40,26 +40,21 @@ DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "60"))
 
-# Poll-Steuerung + Jitter
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
 
+DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "25"))
+
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
 
-# Wie viele Discord-Nachrichten pro Tick prüfen?
-DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "20"))
-
-# =========================
-# Sanity
-# =========================
 if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
     print("Bitte ENV setzen: DISCORD_TOKEN, CHANNEL_ID, ALTRADY_WEBHOOK_URL (+ Keys).")
     sys.exit(1)
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.5"
+    "User-Agent": "DiscordToAltrady-DCA/1.4"
 }
 
 # =========================
@@ -87,13 +82,14 @@ def sleep_until_next_tick():
     jitter = random.uniform(0, max(0, POLL_JITTER_MAX))
     time.sleep(max(0, next_tick - now + jitter))
 
-def fetch_messages(channel_id: str, limit: int = 20):
+def fetch_messages_any(channel_id: str, limit: int = 25):
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
     if r.status_code == 429:
         retry = 5
         try:
-            retry = float(r.json().get("retry_after", 5))
+            if r.headers.get("Content-Type","").startswith("application/json"):
+                retry = float(r.json().get("retry_after", 5))
         except:
             pass
         time.sleep(retry + 0.5)
@@ -101,8 +97,34 @@ def fetch_messages(channel_id: str, limit: int = 20):
     r.raise_for_status()
     return r.json() or []
 
+def message_text(m: dict) -> str:
+    """
+    Zieht content + alle Embeds (title, description, fields, footer) zusammen
+    -> damit wir auch APP/Live-Signal-Formate erwischen.
+    """
+    parts = []
+    parts.append(m.get("content") or "")
+    embeds = m.get("embeds") or []
+    for e in embeds:
+        if not isinstance(e, dict): 
+            continue
+        if e.get("title"): parts.append(str(e.get("title")))
+        if e.get("description"): parts.append(str(e.get("description")))
+        fields = e.get("fields") or []
+        for f in fields:
+            if not isinstance(f, dict): 
+                continue
+            n = f.get("name") or ""
+            v = f.get("value") or ""
+            if n: parts.append(str(n))
+            if v: parts.append(str(v))
+        footer = (e.get("footer") or {}).get("text")
+        if footer: parts.append(str(footer))
+    raw = "\n".join([p for p in parts if p])
+    return clean_markdown(raw)
+
 # =========================
-# Cleaning (Markdown/HTML -> Plain)
+# Cleaning (Markdown -> Plain)
 # =========================
 MD_LINK   = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")
 MD_MARK   = re.compile(r"[*_`~]+")
@@ -118,128 +140,117 @@ def clean_markdown(s: str) -> str:
     s = "\n".join(line.strip() for line in s.split("\n"))
     return s.strip()
 
-def message_text(msg: dict) -> str:
-    parts = []
-    if msg.get("content"): parts.append(msg["content"])
-    embeds = msg.get("embeds") or []
-    for e in embeds:
-        # Titel + Beschreibung + Felder einsammeln
-        t = e.get("title") or ""
-        d = e.get("description") or ""
-        if t: parts.append(t)
-        if d: parts.append(d)
-        for fld in (e.get("fields") or []):
-            name = fld.get("name") or ""
-            val  = fld.get("value") or ""
-            if name: parts.append(name)
-            if val:  parts.append(val)
-        # footer / author reinnehmen falls Text
-        ft = (e.get("footer") or {}).get("text")
-        if ft: parts.append(ft)
-        au = (e.get("author") or {}).get("name")
-        if au: parts.append(au)
-    raw = clean_markdown("\n".join([p for p in parts if p]))
-    return raw
-
 # =========================
-# Regex (tolerant, alle Varianten)
+# Parsing (mehrere Formate)
 # =========================
-# A) Altes Format: "DIA SHORT Signal"
-PAIR_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\b", re.I)
 
-# B) Live Trade Signal: "PUFFER/USDT SHORT …"
-PAIR_SLASH = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s*/\s*(USDT|USDC)\s+(LONG|SHORT)\b", re.I)
+# Altes Format:
+PAIR_LINE_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
+ENTER_LINE      = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
-# C) APP-Format: "Coin: SD" + "Direction: SHORT"
-COIN_LINE  = re.compile(r"(^|\n)\s*Coin\s*:\s*([A-Z0-9]+)\b", re.I)
-DIR_LINE   = re.compile(r"(^|\n)\s*Direction\s*:\s*(LONG|SHORT)\b", re.I)
+# Generische Zeilen:
+TP1_LINE        = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP2_LINE        = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+TP3_LINE        = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA1_LINE       = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA2_LINE       = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+DCA3_LINE       = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
-# D) Fallback: „NEW SIGNAL • SYMBOL • Entry“
-NEW_SIGNAL = re.compile(r"NEW\s+SIGNAL\s*•\s*([A-Z0-9]+)\s*•\s*Entry\b", re.I)
+# Neues Header-Format 1: "🔴 PUFFER/USDT SHORT • Leverage: 25.0x"
+HDR_SLASH_PAIR  = re.compile(r"([A-Z0-9]+)\s*/\s*[A-Z0-9]+\b.*\b(LONG|SHORT)\b", re.I)
 
-# Entry: mehrere Varianten
-ENTER_TRIGGER  = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-ENTRY_COLON    = re.compile(r"(^|\n)\s*Entry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-ENTRY_BLOCK    = re.compile(r"(^|\n)\s*ENTRY\s*$\s*^\s*\$?\s*([0-9]*\.?[0-9]+)\b", re.I | re.M)
+# Neues Header-Format 2: "Coin: SD ... Direction: SHORT"
+HDR_COIN_DIR    = re.compile(r"Coin\s*:\s*([A-Z0-9]+).*?Direction\s*:\s*(LONG|SHORT)", re.I | re.S)
 
-# TPs (mit oder ohne Status-Emojis/HIT etc.)
-TP1_LINE       = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP2_LINE       = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP3_LINE       = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+# ENTRY als Sektion (Wert steht in der nächsten Zeile)
+ENTRY_SECTION   = re.compile(r"\bENTRY\b\s*\n\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
-# DCA (mit # optional)
-DCA1_LINE      = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA2_LINE      = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA3_LINE      = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+def parse_from_old_block(txt: str):
+    mp = PAIR_LINE_OLD.search(txt)
+    if not mp:
+        return None
+    base = mp.group(2).upper()
+    side = "long" if mp.group(3).upper()=="LONG" else "short"
 
-def find_base_side(raw: str):
-    m = PAIR_SLASH.search(raw)
-    if m:
-        base = m.group(2).upper()
-        side = "long" if m.group(4).upper()=="LONG" else "short"
-        return base, side
-    m = PAIR_OLD.search(raw)
-    if m:
-        base = m.group(2).upper()
-        side = "long" if m.group(3).upper()=="LONG" else "short"
-        return base, side
-    m_coin = COIN_LINE.search(raw)
-    m_dir  = DIR_LINE.search(raw)
-    if m_coin and m_dir:
-        base = m_coin.group(2).upper()
-        side = "long" if m_dir.group(2).upper()=="LONG" else "short"
-        return base, side
-    # Fallback: NEW SIGNAL • SYMBOL • Entry  (Side fehlt -> aus Kontext ableiten? Nein: wir brauchen Side)
-    m_new = NEW_SIGNAL.search(raw)
-    if m_new:
-        base = m_new.group(1).upper()
-        # Side heuristisch aus Text herausziehen (SHORT/LONG irgendwo im Block)
-        side_m = re.search(r"\b(LONG|SHORT)\b", raw, re.I)
-        if side_m:
-            side = "long" if side_m.group(1).upper()=="LONG" else "short"
-            return base, side
-    return None, None
-
-def find_entry(raw: str):
-    m = ENTER_TRIGGER.search(raw)
-    if m:
-        return float(m.group(1))
-    m = ENTRY_COLON.search(raw)
-    if m:
-        return float(m.group(2))
-    m = ENTRY_BLOCK.search(raw)
-    if m:
-        return float(m.group(2))
-    return None
-
-def parse_signal_from_text(raw: str):
-    base, side = find_base_side(raw)
-    if not base or not side:
+    me  = ENTER_LINE.search(txt)
+    mt1 = TP1_LINE.search(txt)
+    mt2 = TP2_LINE.search(txt)
+    mt3 = TP3_LINE.search(txt)
+    md1 = DCA1_LINE.search(txt)
+    md2 = DCA2_LINE.search(txt)
+    md3 = DCA3_LINE.search(txt)
+    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
         return None
 
-    entry = find_entry(raw)
-    mt1 = TP1_LINE.search(raw)
-    mt2 = TP2_LINE.search(raw)
-    mt3 = TP3_LINE.search(raw)
-    md1 = DCA1_LINE.search(raw)
-    md2 = DCA2_LINE.search(raw)
-    md3 = DCA3_LINE.search(raw)
+    entry = float(me.group(1))
+    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
+    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
+    return build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3)
 
-    if entry is None or not all([mt1, mt2, mt3, md1, md2, md3]):
+def parse_from_header_slash(txt: str):
+    mh = HDR_SLASH_PAIR.search(txt)
+    if not mh:
+        return None
+    base = mh.group(1).upper()
+    side = "long" if mh.group(2).upper()=="LONG" else "short"
+
+    # Entry entweder als "Entry: $..." ODER in der ENTRY-Sektion
+    me = re.search(r"\bEntry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", txt, re.I)
+    if not me:
+        me = ENTRY_SECTION.search(txt)
+    if not me:
         return None
 
-    tp1 = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
-    d1  = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
+    mt1 = TP1_LINE.search(txt); mt2 = TP2_LINE.search(txt); mt3 = TP3_LINE.search(txt)
+    md1 = DCA1_LINE.search(txt); md2 = DCA2_LINE.search(txt); md3 = DCA3_LINE.search(txt)
+    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
+        return None
 
-    # Plausibilität
+    entry = float(me.group(1))
+    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
+    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
+    return build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3)
+
+def parse_from_coin_direction(txt: str):
+    mh = HDR_COIN_DIR.search(txt)
+    if not mh:
+        return None
+    base = mh.group(1).upper()
+    side = "long" if mh.group(2).upper()=="LONG" else "short"
+
+    me  = re.search(r"\bEntry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", txt, re.I)
+    if not me:
+        me = ENTRY_SECTION.search(txt)
+    if not me:
+        return None
+
+    mt1 = TP1_LINE.search(txt); mt2 = TP2_LINE.search(txt); mt3 = TP3_LINE.search(txt)
+    md1 = DCA1_LINE.search(txt); md2 = DCA2_LINE.search(txt); md3 = DCA3_LINE.search(txt)
+    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
+        return None
+
+    entry = float(me.group(1))
+    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
+    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
+    return build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3)
+
+def build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3):
     if side == "long":
         ok = (tp1>entry and tp2>entry and tp3>entry and d1<entry and d2<entry and d3<entry)
     else:
         ok = (tp1<entry and tp2<entry and tp3<entry and d1>entry and d2>entry and d3>entry)
     if not ok:
         return None
+    return {"base":base,"side":side,"entry":entry,
+            "tp1":tp1,"tp2":tp2,"tp3":tp3,
+            "dca1":d1,"dca2":d2,"dca3":d3}
 
-    return {"base":base,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"tp3":tp3,"dca1":d1,"dca2":d2,"dca3":d3}
+def parse_signal_from_text(txt: str):
+    # Reihenfolge: alt -> Slash-Header -> Coin/Direction
+    for fn in (parse_from_old_block, parse_from_header_slash, parse_from_coin_direction):
+        sig = fn(txt)
+        if sig: return sig
+    return None
 
 # =========================
 # Payload Builder
@@ -249,8 +260,8 @@ def pct_dist(entry: float, price: float) -> float:
 
 def build_altrady_open_payload(sig: dict) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
-    tp1, tp2, tp3     = sig["tp1"], sig["tp2"], sig["tp3"]
-    d1, d2, d3        = sig["dca1"], sig["dca2"], sig["dca3"]
+    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
+    d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
 
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
@@ -312,10 +323,8 @@ def post_to_altrady(payload: dict):
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
             if r.status_code == 429:
                 delay = 2.0
-                try:
-                    delay = float(r.json().get("retry_after", 2.0))
-                except:
-                    pass
+                try: delay = float(r.json().get("retry_after", 2.0))
+                except: pass
                 time.sleep(delay + 0.25)
                 continue
             r.raise_for_status()
@@ -325,66 +334,74 @@ def post_to_altrady(payload: dict):
             time.sleep(1.5 * (attempt + 1))
 
 # =========================
-# Main (scan last N, process first unseen valid)
+# Main
 # =========================
 def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
     print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
-    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s)")
+    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s) | Fetch last {DISCORD_FETCH_LIMIT}")
+
     state = load_state()
     last_id = state.get("last_id")
+    if last_id is None:
+        # beim allerersten Start nicht uralte Messages abarbeiten
+        try:
+            latest = fetch_messages_any(CHANNEL_ID, limit=1)
+            if latest:
+                last_id = int(latest[0].get("id","0"))
+                state["last_id"] = str(last_id)
+                save_state(state)
+        except Exception:
+            pass
 
     while True:
         try:
-            msgs = fetch_messages(CHANNEL_ID, limit=DISCORD_FETCH_LIMIT)
-            if not msgs:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Kanal leer.")
-            else:
-                # Discord liefert meist reverse-chronologisch; wir sortieren chronologisch
-                msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id", "0")))
-                processed_any = False
-                max_seen_id = int(last_id) if last_id else 0
+            msgs = fetch_messages_any(CHANNEL_ID, limit=DISCORD_FETCH_LIMIT)
+            msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
+            max_seen_id = int(last_id or 0)
+            processed_any = False
 
-                for m in msgs_sorted:
-                    mid = int(m.get("id"))
-                    if last_id and mid <= int(last_id):
-                        continue  # bereits verarbeitet/älter
+            for m in msgs_sorted:
+                mid = int(m.get("id","0"))
+                if last_id is not None and mid <= int(last_id):
+                    continue
 
-                    raw = message_text(m)
-                    print("[RAW PREVIEW CLEANED]")
-                    print("\n".join(raw.split("\n")[:60]))
-
-                    sig = parse_signal_from_text(raw)
-                    if sig:
-                        print(f"[PARSED] {sig}")
-                        payload = build_altrady_open_payload(sig)
-                        post_to_altrady(payload)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
-                        processed_any = True
-                        # Wir verarbeiten pro Tick genau EIN Signal (neueste in Reihenfolge),
-                        # danach aktualisieren wir last_id bis zur höchsten gesehenen ID
-                        # und brechen die Schleife.
-                        max_seen_id = max(max_seen_id, mid)
-                        break
+                raw = message_text(m)
+                if not raw:
                     max_seen_id = max(max_seen_id, mid)
+                    continue
 
-                # last_id auf höchste gesehene ID setzen (damit wir nichts doppelt anfassen)
-                if max_seen_id:
-                    last_id = str(max_seen_id)
-                    state["last_id"] = last_id
-                    save_state(state)
+                print("[RAW PREVIEW CLEANED]")
+                print("\n".join(raw.split("\n")[:80]))
 
-                if not processed_any:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Kein neues valides Signal in den letzten {DISCORD_FETCH_LIMIT} Nachrichten.")
+                sig = parse_signal_from_text(raw)
+                if sig:
+                    print(f"[PARSED] {sig}")
+                    payload = build_altrady_open_payload(sig)
+                    post_to_altrady(payload)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
+                    processed_any = True
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal in dieser Message.")
+
+                max_seen_id = max(max_seen_id, mid)
+
+            # nach Batch fortschreiben
+            if max_seen_id > int(last_id or 0):
+                last_id = max_seen_id
+                state["last_id"] = str(last_id)
+                save_state(state)
+
+            if not msgs_sorted:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Kanal leer.")
+
         except KeyboardInterrupt:
             print("\nStopped.")
             break
         except requests.HTTPError as http_err:
             body = ""
-            try:
-                body = http_err.response.text[:200]
-            except:
-                pass
+            try: body = http_err.response.text[:200]
+            except: pass
             print("[HTTP ERROR]", http_err.response.status_code, body or "")
         except Exception:
             print("[ERROR]")
