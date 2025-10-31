@@ -4,6 +4,7 @@
 import os, re, sys, time, json, traceback, html, random
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 import requests
 from dotenv import load_dotenv
 
@@ -18,25 +19,26 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # z.B. BYBI, BYBIF, MEXC ...
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()   # z.B. BYBI, BYBIF, MEXC ...
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
 # Hebel
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
 
-# TP-Split (30/30/30) + Runner (10% via SL abgesichert)
+# TP-Split (30/30/30) + Runner (10% via SL/Trail abgesichert)
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
 TP2_PCT             = float(os.getenv("TP2_PCT", "30"))
 TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
 RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 
-# Trailing-Stop
+# Trailing-Stop (für Runner / globalen Stop-Block)
 TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))
 TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))
 
-# Optionaler harter SL relativ zu DCA3
-USE_HARD_SL         = os.getenv("USE_HARD_SL", "off").lower() == "on"
-SL_BUFFER_PCT       = float(os.getenv("SL_BUFFER_PCT", "5.0"))
+# Initialer SL-Referenzpunkt & Schutz-Logik
+STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "BREAK_EVEN").strip().upper()  # PRICE | BREAK_EVEN | FOLLOW_TAKE_PROFIT
+BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()              # NONE | ENTRY | DCA3
+SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "5.0"))
 
 # DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
@@ -70,7 +72,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.6"
+    "User-Agent": "DiscordToAltrady-DCA/1.7"
 }
 
 # =========================
@@ -98,7 +100,7 @@ def sleep_until_next_tick():
     jitter = random.uniform(0, max(0, POLL_JITTER_MAX))
     time.sleep(max(0, next_tick - now + jitter))
 
-def fetch_messages_after(channel_id: str, after_id: str | None, limit: int = 50):
+def fetch_messages_after(channel_id: str, after_id: Optional[str], limit: int = 50):
     """
     Holt Messages > after_id (strictly newer). Discord unterstützt 'after'.
     Wir paginieren, bis weniger als 'limit' zurückkommt.
@@ -215,7 +217,7 @@ def find_base_side(txt: str):
         return mc.group(1).upper(), ("long" if mc.group(2).upper()=="LONG" else "short")
     return None, None
 
-def find_entry(txt: str):
+def find_entry(txt: str) -> Optional[float]:
     for rx in (ENTER_ON_TRIGGER, ENTRY_COLON, ENTRY_SECTION):
         m = rx.search(txt)
         if m:
@@ -285,6 +287,22 @@ def parse_signal_from_text(txt: str):
 def pct_dist(entry: float, price: float) -> float:
     return abs((price - entry) / entry) * 100.0
 
+def compute_base_stop_percentage(side: str, entry: float, d3: float) -> Optional[float]:
+    """
+    Liefert die stop_percentage relativ zum Entry (in %), basierend auf BASE_STOP_MODE.
+    - ENTRY: SL = Entry ± SL_BUFFER_PCT
+    - DCA3 : SL = DCA3 ± SL_BUFFER_PCT
+    - NONE : kein initialer SL
+    """
+    mode = BASE_STOP_MODE
+    if mode == "NONE":
+        return None
+    if mode == "ENTRY":
+        sl_price = entry * (1 - SL_BUFFER_PCT/100.0) if side == "long" else entry * (1 + SL_BUFFER_PCT/100.0)
+    else:  # "DCA3" default
+        sl_price = d3 * (1 - SL_BUFFER_PCT/100.0) if side == "long" else d3 * (1 + SL_BUFFER_PCT/100.0)
+    return pct_dist(entry, sl_price)
+
 def build_altrady_open_payload(sig: dict) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
@@ -299,10 +317,16 @@ def build_altrady_open_payload(sig: dict) -> dict:
     dca2_pct = pct_dist(entry, d2)
     dca3_pct = pct_dist(entry, d3)
 
-    stop_percentage = None
-    if USE_HARD_SL:
-        sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0) if side=="short" else d3 * (1.0 - SL_BUFFER_PCT/100.0)
-        stop_percentage = pct_dist(entry, sl_price)
+    # Initialen SL IMMER mitsenden (sichtbar in Altrady), Schutz-Logik via STOP_PROTECTION_TYPE
+    base_stop_pct = compute_base_stop_percentage(side, entry, d3)
+
+    stop_loss_obj = {
+        "protection_type": STOP_PROTECTION_TYPE,         # PRICE | BREAK_EVEN | FOLLOW_TAKE_PROFIT
+        "trailing_percentage": TRAILING_PERCENTAGE,
+        "trailing_distance":  TRAILING_DISTANCE
+    }
+    if base_stop_pct is not None:
+        stop_loss_obj["stop_percentage"] = float(f"{base_stop_pct:.6f}")
 
     payload = {
         "action": "open",
@@ -327,13 +351,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
             {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
         ],
 
-        "stop_loss": {
-            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {}),
-            "protection_type": "PRICE",
-            "trailing_percentage": TRAILING_PERCENTAGE,
-            "trailing_distance":  TRAILING_DISTANCE
-        },
-
+        "stop_loss": stop_loss_obj,
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
 
@@ -365,7 +383,7 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
-    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
+    print(f"   Stop: {STOP_PROTECTION_TYPE} | Base:{BASE_STOP_MODE} (±{SL_BUFFER_PCT}%) | Trail {TRAILING_PERCENTAGE}% / dist {TRAILING_DISTANCE}%")
     print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s) | Fetch page ≤ {DISCORD_FETCH_LIMIT}")
 
     state = load_state()
