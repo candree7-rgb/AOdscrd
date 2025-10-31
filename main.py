@@ -18,43 +18,48 @@ CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
 ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
 ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # z.B. BYBI, BYBIF, MEXC
+ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()  # z.B. BYBI, BYBIF, MEXC ...
 QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
 
+# Hebel
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
 
+# TP-Split (30/30/30) + Runner (10% via SL abgesichert)
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
 TP2_PCT             = float(os.getenv("TP2_PCT", "30"))
 TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
 RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 
+# Trailing-Stop
 TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))
 TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))
 
+# Optionaler harter SL relativ zu DCA3
 USE_HARD_SL         = os.getenv("USE_HARD_SL", "off").lower() == "on"
 SL_BUFFER_PCT       = float(os.getenv("SL_BUFFER_PCT", "5.0"))
 
+# DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
 DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "225"))
 DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
-ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "60"))
+# Falls DCA-Level im Signal fehlen: Distanz in % vom Entry
+DCA1_DIST_PCT       = float(os.getenv("DCA1_DIST_PCT", "5"))
+DCA2_DIST_PCT       = float(os.getenv("DCA2_DIST_PCT", "10"))
+DCA3_DIST_PCT       = float(os.getenv("DCA3_DIST_PCT", "20"))
 
+# Limit-Order Ablauf (Minuten)
+ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "180"))
+
+# Poll-Steuerung + Jitter
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
 POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
 
-DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "25"))
+# Fetch-Größe pro Page (Discord API max 100)
+DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "50"))
 
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
-
-# Stop-Logik (neu):
-# STOP_MODE: FOLLOW_TP (empfohlen) oder PRICE
-STOP_MODE           = os.getenv("STOP_MODE", "FOLLOW_TP").strip().upper()
-# Ab welchem TP auf Break-Even springen (1 = TP1)
-BE_AFTER_TP_INDEX   = int(os.getenv("BE_AFTER_TP_INDEX", "1"))
-# Ab welchem TP Trailing aktiv werden soll (2 = ab TP2)
-TRAIL_FROM_TP_INDEX = int(os.getenv("TRAIL_FROM_TP_INDEX", "2"))
 
 # =========================
 # Sanity
@@ -65,7 +70,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.5"
+    "User-Agent": "DiscordToAltrady-DCA/1.6"
 }
 
 # =========================
@@ -93,42 +98,37 @@ def sleep_until_next_tick():
     jitter = random.uniform(0, max(0, POLL_JITTER_MAX))
     time.sleep(max(0, next_tick - now + jitter))
 
-def fetch_messages_any(channel_id: str, limit: int = 25):
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
-    if r.status_code == 429:
-        retry = 5
-        try:
-            if r.headers.get("Content-Type","").startswith("application/json"):
-                retry = float(r.json().get("retry_after", 5))
-        except:
-            pass
-        time.sleep(retry + 0.5)
-        r = requests.get(url, headers=HEADERS, params={"limit": limit}, timeout=15)
-    r.raise_for_status()
-    return r.json() or []
+def fetch_messages_after(channel_id: str, after_id: str | None, limit: int = 50):
+    """
+    Holt Messages > after_id (strictly newer). Discord unterstützt 'after'.
+    Wir paginieren, bis weniger als 'limit' zurückkommt.
+    """
+    collected = []
+    params = {"limit": max(1, min(limit, 100))}
+    if after_id:
+        params["after"] = str(after_id)
 
-def message_text(m: dict) -> str:
-    parts = []
-    parts.append(m.get("content") or "")
-    embeds = m.get("embeds") or []
-    for e in embeds:
-        if not isinstance(e, dict): 
+    while True:
+        r = requests.get(f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                         headers=HEADERS, params=params, timeout=15)
+        if r.status_code == 429:
+            retry = 5
+            try:
+                if r.headers.get("Content-Type","").startswith("application/json"):
+                    retry = float(r.json().get("retry_after", 5))
+            except:
+                pass
+            time.sleep(retry + 0.5)
             continue
-        if e.get("title"): parts.append(str(e.get("title")))
-        if e.get("description"): parts.append(str(e.get("description")))
-        fields = e.get("fields") or []
-        for f in fields:
-            if not isinstance(f, dict): 
-                continue
-            n = f.get("name") or ""
-            v = f.get("value") or ""
-            if n: parts.append(str(n))
-            if v: parts.append(str(v))
-        footer = (e.get("footer") or {}).get("text")
-        if footer: parts.append(str(footer))
-    raw = "\n".join([p for p in parts if p])
-    return clean_markdown(raw)
+        r.raise_for_status()
+        page = r.json() or []
+        collected.extend(page)
+        if len(page) < params["limit"]:
+            break
+        # weiter paginieren ab dem neuesten (höchste ID) der Page
+        max_id = max(int(m.get("id","0")) for m in page if "id" in m)
+        params["after"] = str(max_id)
+    return collected
 
 # =========================
 # Cleaning (Markdown -> Plain)
@@ -136,126 +136,148 @@ def message_text(m: dict) -> str:
 MD_LINK   = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")
 MD_MARK   = re.compile(r"[*_`~]+")
 MULTI_WS  = re.compile(r"[ \t\u00A0]+")
+NUM       = r"([0-9][0-9,]*\.?[0-9]*)"  # erlaubt auch 105,000.00
 
 def clean_markdown(s: str) -> str:
     if not s: return ""
     s = s.replace("\r", "")
     s = html.unescape(s)
-    s = MD_LINK.sub(r"\1", s)
-    s = MD_MARK.sub("", s)
-    s = MULTI_WS.sub(" ", s)
+    s = MD_LINK.sub(r"\1", s)     # [text](url) -> text
+    s = MD_MARK.sub("", s)        # *, _, `, ~ entfernen
+    s = MULTI_WS.sub(" ", s)      # mehrfachen Whitespace normalisieren
     s = "\n".join(line.strip() for line in s.split("\n"))
     return s.strip()
 
+def to_price(s: str) -> float:
+    return float(s.replace(",", ""))
+
+def message_text(m: dict) -> str:
+    """
+    Kombiniert content + Embeds (title, description, fields, footer),
+    damit auch App/Live-Formate vollständig sind.
+    """
+    parts = []
+    parts.append(m.get("content") or "")
+    embeds = m.get("embeds") or []
+    for e in embeds:
+        if not isinstance(e, dict):
+            continue
+        if e.get("title"): parts.append(str(e.get("title")))
+        if e.get("description"): parts.append(str(e.get("description")))
+        fields = e.get("fields") or []
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            n = f.get("name") or ""
+            v = f.get("value") or ""
+            if n: parts.append(str(n))
+            if v: parts.append(str(v))
+        footer = (e.get("footer") or {}).get("text")
+        if footer: parts.append(str(footer))
+    return clean_markdown("\n".join([p for p in parts if p]))
+
 # =========================
-# Parsing (mehrere Formate)
+# Parsing (mehrere Formate, tolerant)
 # =========================
 
-# Altes Format:
+# 1) Klassisch:  TICKER LONG|SHORT Signal
 PAIR_LINE_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\n|$)", re.I)
-ENTER_LINE      = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
 
-# Generische Zeilen:
-TP1_LINE        = re.compile(r"TP\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP2_LINE        = re.compile(r"TP\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-TP3_LINE        = re.compile(r"TP\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA1_LINE       = re.compile(r"DCA\s*#?\s*1\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA2_LINE       = re.compile(r"DCA\s*#?\s*2\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-DCA3_LINE       = re.compile(r"DCA\s*#?\s*3\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
-
-# Neues Header-Format 1: "🔴 PUFFER/USDT SHORT • Leverage: 25.0x"
+# 2) Header mit Slash:  🔴 PIPPIN/USDT SHORT • Leverage ...
 HDR_SLASH_PAIR  = re.compile(r"([A-Z0-9]+)\s*/\s*[A-Z0-9]+\b.*\b(LONG|SHORT)\b", re.I)
 
-# Neues Header-Format 2: "Coin: SD ... Direction: SHORT"
+# 3) „Coin: SD … Direction: SHORT“
 HDR_COIN_DIR    = re.compile(r"Coin\s*:\s*([A-Z0-9]+).*?Direction\s*:\s*(LONG|SHORT)", re.I | re.S)
 
-# ENTRY als Sektion (Wert steht in der nächsten Zeile)
-ENTRY_SECTION   = re.compile(r"\bENTRY\b\s*\n\s*\$?\s*([0-9]*\.?[0-9]+)", re.I)
+# Entry-Varianten
+ENTER_ON_TRIGGER = re.compile(r"Enter\s+on\s+Trigger\s*:\s*\$?\s*"+NUM, re.I)
+ENTRY_COLON      = re.compile(r"\bEntry\s*:\s*\$?\s*"+NUM, re.I)
+ENTRY_SECTION    = re.compile(r"\bENTRY\b\s*\n\s*\$?\s*"+NUM, re.I)
 
-def parse_from_old_block(txt: str):
-    mp = PAIR_LINE_OLD.search(txt)
-    if not mp:
-        return None
-    base = mp.group(2).upper()
-    side = "long" if mp.group(3).upper()=="LONG" else "short"
+# Generische Ziele / DCA
+TP1_LINE        = re.compile(r"\bTP\s*1\s*:\s*\$?\s*"+NUM, re.I)
+TP2_LINE        = re.compile(r"\bTP\s*2\s*:\s*\$?\s*"+NUM, re.I)
+TP3_LINE        = re.compile(r"\bTP\s*3\s*:\s*\$?\s*"+NUM, re.I)
+DCA1_LINE       = re.compile(r"\bDCA\s*#?\s*1\s*:\s*\$?\s*"+NUM, re.I)
+DCA2_LINE       = re.compile(r"\bDCA\s*#?\s*2\s*:\s*\$?\s*"+NUM, re.I)
+DCA3_LINE       = re.compile(r"\bDCA\s*#?\s*3\s*:\s*\$?\s*"+NUM, re.I)
 
-    me  = ENTER_LINE.search(txt)
-    mt1 = TP1_LINE.search(txt)
-    mt2 = TP2_LINE.search(txt)
-    mt3 = TP3_LINE.search(txt)
-    md1 = DCA1_LINE.search(txt)
-    md2 = DCA2_LINE.search(txt)
-    md3 = DCA3_LINE.search(txt)
-    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
-        return None
-
-    entry = float(me.group(1))
-    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
-    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
-    return build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3)
-
-def parse_from_header_slash(txt: str):
+def find_base_side(txt: str):
+    # Prio: Slash-Header -> Classic „SHORT Signal“ -> Coin/Direction
     mh = HDR_SLASH_PAIR.search(txt)
-    if not mh:
-        return None
-    base = mh.group(1).upper()
-    side = "long" if mh.group(2).upper()=="LONG" else "short"
+    if mh:
+        return mh.group(1).upper(), ("long" if mh.group(2).upper()=="LONG" else "short")
+    mo = PAIR_LINE_OLD.search(txt)
+    if mo:
+        return mo.group(2).upper(), ("long" if mo.group(3).upper()=="LONG" else "short")
+    mc = HDR_COIN_DIR.search(txt)
+    if mc:
+        return mc.group(1).upper(), ("long" if mc.group(2).upper()=="LONG" else "short")
+    return None, None
 
-    me = re.search(r"\bEntry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", txt, re.I)
-    if not me:
-        me = ENTRY_SECTION.search(txt)
-    if not me:
-        return None
+def find_entry(txt: str):
+    for rx in (ENTER_ON_TRIGGER, ENTRY_COLON, ENTRY_SECTION):
+        m = rx.search(txt)
+        if m:
+            return to_price(m.group(1))
+    return None
 
-    mt1 = TP1_LINE.search(txt); mt2 = TP2_LINE.search(txt); mt3 = TP3_LINE.search(txt)
-    md1 = DCA1_LINE.search(txt); md2 = DCA2_LINE.search(txt); md3 = DCA3_LINE.search(txt)
-    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
-        return None
+def find_tp_dca(txt: str):
+    tps = []
+    for rx in (TP1_LINE, TP2_LINE, TP3_LINE):
+        m = rx.search(txt)
+        tps.append(to_price(m.group(1)) if m else None)
+    dcas = []
+    for rx in (DCA1_LINE, DCA2_LINE, DCA3_LINE):
+        m = rx.search(txt)
+        dcas.append(to_price(m.group(1)) if m else None)
+    return tps, dcas
 
-    entry = float(me.group(1))
-    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
-    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
-    return build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3)
+def backfill_dcas_if_missing(side: str, entry: float, dcas: list) -> list:
+    """
+    Ergänzt fehlende DCA-Preise anhand ENV-% vom Entry.
+    SHORT: DCA über Entry, LONG: DCA unter Entry.
+    """
+    d1, d2, d3 = dcas
+    if d1 is None:
+        d1 = entry * (1 + DCA1_DIST_PCT/100.0) if side=="short" else entry * (1 - DCA1_DIST_PCT/100.0)
+    if d2 is None:
+        d2 = entry * (1 + DCA2_DIST_PCT/100.0) if side=="short" else entry * (1 - DCA2_DIST_PCT/100.0)
+    if d3 is None:
+        d3 = entry * (1 + DCA3_DIST_PCT/100.0) if side=="short" else entry * (1 - DCA3_DIST_PCT/100.0)
+    return [d1, d2, d3]
 
-def parse_from_coin_direction(txt: str):
-    mh = HDR_COIN_DIR.search(txt)
-    if not mh:
-        return None
-    base = mh.group(1).upper()
-    side = "long" if mh.group(2).upper()=="LONG" else "short"
-
-    me  = re.search(r"\bEntry\s*:\s*\$?\s*([0-9]*\.?[0-9]+)", txt, re.I)
-    if not me:
-        me = ENTRY_SECTION.search(txt)
-    if not me:
-        return None
-
-    mt1 = TP1_LINE.search(txt); mt2 = TP2_LINE.search(txt); mt3 = TP3_LINE.search(txt)
-    md1 = DCA1_LINE.search(txt); md2 = DCA2_LINE.search(txt); md3 = DCA3_LINE.search(txt)
-    if not all([me, mt1, mt2, mt3, md1, md2, md3]):
-        return None
-
-    entry = float(me.group(1))
-    tp1   = float(mt1.group(1)); tp2 = float(mt2.group(1)); tp3 = float(mt3.group(1))
-    d1    = float(md1.group(1)); d2  = float(md2.group(1)); d3  = float(md3.group(1))
-    return build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3)
-
-def build_sig_if_plausible(base, side, entry, tp1, tp2, tp3, d1, d2, d3):
+def plausible(side: str, entry: float, tp1: float, tp2: float, tp3: float, d1: float, d2: float, d3: float) -> bool:
     if side == "long":
-        ok = (tp1>entry and tp2>entry and tp3>entry and d1<entry and d2<entry and d3<entry)
+        return (tp1>entry and tp2>entry and tp3>entry and d1<entry and d2<entry and d3<entry)
     else:
-        ok = (tp1<entry and tp2<entry and tp3<entry and d1>entry and d2>entry and d3>entry)
-    if not ok:
-        return None
-    return {"base":base,"side":side,"entry":entry,
-            "tp1":tp1,"tp2":tp2,"tp3":tp3,
-            "dca1":d1,"dca2":d2,"dca3":d3}
+        return (tp1<entry and tp2<entry and tp3<entry and d1>entry and d2>entry and d3>entry)
 
 def parse_signal_from_text(txt: str):
-    for fn in (parse_from_old_block, parse_from_header_slash, parse_from_coin_direction):
-        sig = fn(txt)
-        if sig: return sig
-    return None
+    base, side = find_base_side(txt)
+    if not base or not side:
+        return None
+    entry = find_entry(txt)
+    if entry is None:
+        return None
+
+    (tp1, tp2, tp3), (d1, d2, d3) = find_tp_dca(txt)
+
+    # TPs müssen vorhanden sein
+    if None in (tp1, tp2, tp3):
+        return None
+
+    # DCA optional -> ggf. auffüllen
+    d1, d2, d3 = backfill_dcas_if_missing(side, entry, [d1, d2, d3])
+
+    if not plausible(side, entry, tp1, tp2, tp3, d1, d2, d3):
+        return None
+
+    return {
+        "base": base, "side": side, "entry": entry,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "dca1": d1,  "dca2": d2,  "dca3": d3
+    }
 
 # =========================
 # Payload Builder
@@ -282,27 +304,6 @@ def build_altrady_open_payload(sig: dict) -> dict:
         sl_price = d3 * (1.0 + SL_BUFFER_PCT/100.0) if side=="short" else d3 * (1.0 - SL_BUFFER_PCT/100.0)
         stop_percentage = pct_dist(entry, sl_price)
 
-    # --- Stop-Block ---
-    if STOP_MODE == "FOLLOW_TP":
-        stop_loss_block = {
-            # Auto-BE nach TP1 (Index 1) und Trailing ab TP2 (Index 2)
-            "protection_type": "FOLLOW_TAKE_PROFIT",
-            "breakeven_at_take_profit_index": BE_AFTER_TP_INDEX,   # 1 => nach TP1
-            "trailing_from_take_profit_index": TRAIL_FROM_TP_INDEX, # 2 => ab TP2
-            "trailing_percentage": TRAILING_PERCENTAGE,
-            "trailing_distance":  TRAILING_DISTANCE,
-            # Optionaler harter Cap zusätzlich (falls gesetzt):
-            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {})
-        }
-    else:
-        # Fallback: klassischer Preis-/Trailing-Stop ohne TP-Kopplung
-        stop_loss_block = {
-            "protection_type": "PRICE",
-            "trailing_percentage": TRAILING_PERCENTAGE,
-            "trailing_distance":  TRAILING_DISTANCE,
-            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {})
-        }
-
     payload = {
         "action": "open",
         "api_key": ALTRADY_API_KEY,
@@ -326,7 +327,12 @@ def build_altrady_open_payload(sig: dict) -> dict:
             {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
         ],
 
-        "stop_loss": stop_loss_block,
+        "stop_loss": {
+            **({"stop_percentage": float(f"{stop_percentage:.6f}")} if stop_percentage is not None else {}),
+            "protection_type": "PRICE",
+            "trailing_percentage": TRAILING_PERCENTAGE,
+            "trailing_distance":  TRAILING_DISTANCE
+        },
 
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
@@ -359,59 +365,52 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
-    print(f"   Stop-Mode: {STOP_MODE} | BE nach TP#{BE_AFTER_TP_INDEX} | Trailing ab TP#{TRAIL_FROM_TP_INDEX}")
-    print(f"   Trailing: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
-    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s) | Fetch last {DISCORD_FETCH_LIMIT}")
+    print(f"   Trailing SL: {TRAILING_PERCENTAGE}% (dist {TRAILING_DISTANCE}%) | Hard SL {'ON' if USE_HARD_SL else 'OFF'} (±{SL_BUFFER_PCT}% v. DCA3)")
+    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s) | Fetch page ≤ {DISCORD_FETCH_LIMIT}")
 
     state = load_state()
     last_id = state.get("last_id")
+
+    # Erststart: baseline auf aktuellste Message setzen (nicht rückwirkend spammen)
     if last_id is None:
         try:
-            latest = fetch_messages_any(CHANNEL_ID, limit=1)
-            if latest:
-                last_id = int(latest[0].get("id","0"))
-                state["last_id"] = str(last_id)
+            page = fetch_messages_after(CHANNEL_ID, None, limit=1)
+            if page:
+                last_id = str(page[0]["id"])
+                state["last_id"] = last_id
                 save_state(state)
         except Exception:
             pass
 
     while True:
         try:
-            msgs = fetch_messages_any(CHANNEL_ID, limit=DISCORD_FETCH_LIMIT)
+            msgs = fetch_messages_after(CHANNEL_ID, last_id, limit=DISCORD_FETCH_LIMIT)
+            # Discord liefert „neueste zuerst“, sortieren aufsteigend, damit wir chronologisch verarbeiten
             msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
-            max_seen_id = int(last_id or 0)
-
-            for m in msgs_sorted:
-                mid = int(m.get("id","0"))
-                if last_id is not None and mid <= int(last_id):
-                    continue
-
-                raw = message_text(m)
-                if not raw:
-                    max_seen_id = max(max_seen_id, mid)
-                    continue
-
-                print("[RAW PREVIEW CLEANED]")
-                print("\n".join(raw.split("\n")[:80]))
-
-                sig = parse_signal_from_text(raw)
-                if sig:
-                    print(f"[PARSED] {sig}")
-                    payload = build_altrady_open_payload(sig)
-                    post_to_altrady(payload)
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal in dieser Message.")
-
-                max_seen_id = max(max_seen_id, mid)
-
-            if max_seen_id > int(last_id or 0):
-                last_id = max_seen_id
-                state["last_id"] = str(last_id)
-                save_state(state)
+            max_seen = int(last_id or 0)
 
             if not msgs_sorted:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Kanal leer.")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Keine neuen Nachrichten.")
+            else:
+                for m in msgs_sorted:
+                    mid = int(m.get("id","0"))
+                    raw = message_text(m)
+                    if raw:
+                        print("[RAW PREVIEW CLEANED]")
+                        print("\n".join(raw.split("\n")[:80]))
+                        sig = parse_signal_from_text(raw)
+                        if sig:
+                            print(f"[PARSED] {sig}")
+                            payload = build_altrady_open_payload(sig)
+                            post_to_altrady(payload)
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ an Altrady gesendet: {sig['base']} {sig['side']} @ {sig['entry']}")
+                        else:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Kein gültiges Signal in dieser Message.")
+                    max_seen = max(max_seen, mid)
+
+                last_id = str(max_seen)
+                state["last_id"] = last_id
+                save_state(state)
 
         except KeyboardInterrupt:
             print("\nStopped.")
