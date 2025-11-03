@@ -31,14 +31,14 @@ TP2_PCT             = float(os.getenv("TP2_PCT", "30"))
 TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
 RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 
-# Trailing-Stop (für Runner / globalen Stop-Block)
-TRAILING_PERCENTAGE = float(os.getenv("TRAILING_PERCENTAGE", "3.0"))
-TRAILING_DISTANCE   = float(os.getenv("TRAILING_DISTANCE", "0.5"))
+# Trailing für Runner (nur beim letzten TP!)
+RUNNER_TRAILING_DIST = float(os.getenv("RUNNER_TRAILING_DIST", "1.5"))  # 1.5% trailing für Runner
+RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))  # Runner TP = TP3 * 1.5
 
-# Initialer SL-Referenzpunkt & Schutz-Logik
-STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "BREAK_EVEN").strip().upper()  # PRICE | BREAK_EVEN | FOLLOW_TAKE_PROFIT
-BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()              # NONE | ENTRY | DCA3
-SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "5.0"))
+# Stop-Loss Protection Einstellungen
+STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()  # FOLLOW_TAKE_PROFIT empfohlen!
+BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()                      # NONE | ENTRY | DCA3
+SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "5.0"))                                 # 5% Buffer hinter DCA3
 
 # DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
@@ -72,7 +72,7 @@ if not DISCORD_TOKEN or not CHANNEL_ID or not ALTRADY_WEBHOOK_URL:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,   # User-Session oder Bot-Token
-    "User-Agent": "DiscordToAltrady-DCA/1.7"
+    "User-Agent": "DiscordToAltrady-DCA/1.8"
 }
 
 # =========================
@@ -188,7 +188,7 @@ PAIR_LINE_OLD   = re.compile(r"(^|\n)\s*([A-Z0-9]+)\s+(LONG|SHORT)\s+Signal\s*(\
 # 2) Header mit Slash:  🔴 PIPPIN/USDT SHORT • Leverage ...
 HDR_SLASH_PAIR  = re.compile(r"([A-Z0-9]+)\s*/\s*[A-Z0-9]+\b.*\b(LONG|SHORT)\b", re.I)
 
-# 3) „Coin: SD … Direction: SHORT“
+# 3) „Coin: SD … Direction: SHORT"
 HDR_COIN_DIR    = re.compile(r"Coin\s*:\s*([A-Z0-9]+).*?Direction\s*:\s*(LONG|SHORT)", re.I | re.S)
 
 # Entry-Varianten
@@ -205,7 +205,7 @@ DCA2_LINE       = re.compile(r"\bDCA\s*#?\s*2\s*:\s*\$?\s*"+NUM, re.I)
 DCA3_LINE       = re.compile(r"\bDCA\s*#?\s*3\s*:\s*\$?\s*"+NUM, re.I)
 
 def find_base_side(txt: str):
-    # Prio: Slash-Header -> Classic „SHORT Signal“ -> Coin/Direction
+    # Prio: Slash-Header -> Classic „SHORT Signal" -> Coin/Direction
     mh = HDR_SLASH_PAIR.search(txt)
     if mh:
         return mh.group(1).upper(), ("long" if mh.group(2).upper()=="LONG" else "short")
@@ -282,25 +282,25 @@ def parse_signal_from_text(txt: str):
     }
 
 # =========================
-# Payload Builder
+# Payload Builder (KORRIGIERT!)
 # =========================
 def pct_dist(entry: float, price: float) -> float:
     return abs((price - entry) / entry) * 100.0
 
-def compute_base_stop_percentage(side: str, entry: float, d3: float) -> Optional[float]:
+def compute_base_stop_percentage(side: str, entry: float, d3: float) -> float:
     """
-    Liefert die stop_percentage relativ zum Entry (in %), basierend auf BASE_STOP_MODE.
-    - ENTRY: SL = Entry ± SL_BUFFER_PCT
-    - DCA3 : SL = DCA3 ± SL_BUFFER_PCT
-    - NONE : kein initialer SL
+    Berechnet den initialen Stop-Loss basierend auf BASE_STOP_MODE.
+    Gibt IMMER einen Wert zurück (kein None mehr!).
     """
     mode = BASE_STOP_MODE
     if mode == "NONE":
-        return None
-    if mode == "ENTRY":
+        # Selbst bei "NONE" setzen wir einen fernen Notfall-SL (z.B. 50%)
+        return 50.0
+    elif mode == "ENTRY":
         sl_price = entry * (1 - SL_BUFFER_PCT/100.0) if side == "long" else entry * (1 + SL_BUFFER_PCT/100.0)
     else:  # "DCA3" default
         sl_price = d3 * (1 - SL_BUFFER_PCT/100.0) if side == "long" else d3 * (1 + SL_BUFFER_PCT/100.0)
+    
     return pct_dist(entry, sl_price)
 
 def build_altrady_open_payload(sig: dict) -> dict:
@@ -317,16 +317,31 @@ def build_altrady_open_payload(sig: dict) -> dict:
     dca2_pct = pct_dist(entry, d2)
     dca3_pct = pct_dist(entry, d3)
 
-    # Initialen SL IMMER mitsenden (sichtbar in Altrady), Schutz-Logik via STOP_PROTECTION_TYPE
+    # WICHTIG: Initialer Stop-Loss MUSS gesetzt werden!
     base_stop_pct = compute_base_stop_percentage(side, entry, d3)
-
+    
+    # Stop-Loss Objekt - NUR mit den nötigen Feldern für FOLLOW_TAKE_PROFIT
     stop_loss_obj = {
-        "protection_type": STOP_PROTECTION_TYPE,         # PRICE | BREAK_EVEN | FOLLOW_TAKE_PROFIT
-        "trailing_percentage": TRAILING_PERCENTAGE,
-        "trailing_distance":  TRAILING_DISTANCE
+        "stop_percentage": float(f"{base_stop_pct:.6f}"),
+        "protection_type": STOP_PROTECTION_TYPE  # FOLLOW_TAKE_PROFIT aus ENV
     }
-    if base_stop_pct is not None:
-        stop_loss_obj["stop_percentage"] = float(f"{base_stop_pct:.6f}")
+    # KEINE trailing_percentage oder trailing_distance hier!
+
+    # Take Profit Array mit 4 TPs (3 normale + 1 Runner)
+    take_profits = [
+        {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
+        {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
+        {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
+    ]
+    
+    # Runner TP nur wenn RUNNER_PCT > 0
+    if RUNNER_PCT > 0:
+        runner_tp_pct = tp3_pct * RUNNER_TP_MULTIPLIER  # z.B. TP3 * 1.5
+        take_profits.append({
+            "price_percentage": float(f"{runner_tp_pct:.6f}"),
+            "position_percentage": RUNNER_PCT,
+            "trailing_distance": RUNNER_TRAILING_DIST  # Trailing NUR für den Runner!
+        })
 
     payload = {
         "action": "open",
@@ -345,24 +360,25 @@ def build_altrady_open_payload(sig: dict) -> dict:
             {"price_percentage": float(f"{dca3_pct:.6f}"), "quantity_percentage": DCA3_QTY_PCT},
         ],
 
-        "take_profit": [
-            {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
-            {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
-            {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
-        ],
-
+        "take_profit": take_profits,
         "stop_loss": stop_loss_obj,
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
 
-    if abs((TP1_PCT + TP2_PCT + TP3_PCT + RUNNER_PCT) - 100.0) > 1e-6:
-        print("⚠️ Hinweis: TP1+TP2+TP3+RUNNER != 100%. Prüfe ENV-Splits.")
+    # Debug-Log für Validierung
+    total_tp_pct = TP1_PCT + TP2_PCT + TP3_PCT + RUNNER_PCT
+    if abs(total_tp_pct - 100.0) > 0.01:
+        print(f"⚠️ Warnung: TP-Summe = {total_tp_pct}% (sollte 100% sein)")
+    
     return payload
 
 # =========================
 # Sender
 # =========================
 def post_to_altrady(payload: dict):
+    print("\n[DEBUG] Sending to Altrady:")
+    print(json.dumps(payload, indent=2))
+    
     for attempt in range(3):
         try:
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
@@ -383,8 +399,8 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print(f"➡️ Altrady:{ALTRADY_EXCHANGE} | Quote:{QUOTE} | Lev:{FIXED_LEVERAGE}x | TP% {TP1_PCT}/{TP2_PCT}/{TP3_PCT} + Runner {RUNNER_PCT}%")
-    print(f"   Stop: {STOP_PROTECTION_TYPE} | Base:{BASE_STOP_MODE} (±{SL_BUFFER_PCT}%) | Trail {TRAILING_PERCENTAGE}% / dist {TRAILING_DISTANCE}%")
-    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s) | Fetch page ≤ {DISCORD_FETCH_LIMIT}")
+    print(f"   Stop: {STOP_PROTECTION_TYPE} | Base:{BASE_STOP_MODE} (±{SL_BUFFER_PCT}%) | Runner Trail: {RUNNER_TRAILING_DIST}%")
+    print(f"   Entry Expiration: {ENTRY_EXPIRATION_MIN} min | Poll: {POLL_BASE_SECONDS}s + {POLL_OFFSET_SECONDS}s (+Jitter ≤ {POLL_JITTER_MAX}s)")
 
     state = load_state()
     last_id = state.get("last_id")
@@ -403,7 +419,7 @@ def main():
     while True:
         try:
             msgs = fetch_messages_after(CHANNEL_ID, last_id, limit=DISCORD_FETCH_LIMIT)
-            # Discord liefert „neueste zuerst“, sortieren aufsteigend, damit wir chronologisch verarbeiten
+            # Discord liefert „neueste zuerst", sortieren aufsteigend, damit wir chronologisch verarbeiten
             msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
             max_seen = int(last_id or 0)
 
