@@ -261,41 +261,20 @@ def parse_signal_from_text(txt: str):
     }
 
 # =========================
-# Altrady Payload - FINALER FIX
+# Altrady Payload - FINAL MIT PROZENT
 # =========================
-def pct_dist(entry: float, price: float) -> float:
-    return abs((price - entry) / entry) * 100.0
-
-def compute_stop_price(side: str, entry: float, d3: float) -> float:
-    """Berechnet Stop-Loss PREIS basierend auf DCA3 +/- Buffer%"""
-    mode = BASE_STOP_MODE
-    dca3_dist = pct_dist(entry, d3)
+def compute_stop_loss_percentage(side: str, entry: float, d3: float) -> float:
+    """Berechnet Stop-Loss PROZENT vom Entry basierend auf DCA3 + Buffer"""
     
-    # Dynamischer Buffer bei extremen DCAs
-    if dca3_dist > 30:
-        buffer = 10.0
-        print(f"   ⚠️ DCA3 bei {dca3_dist:.1f}% → SL Buffer erhöht auf {buffer}%")
-    else:
-        buffer = SL_BUFFER_PCT
+    # Berechne Distanz von Entry zu DCA3
+    dca3_dist = abs((d3 - entry) / entry) * 100.0
     
-    if mode == "NONE":
-        # Extremer Stop bei 50%
-        if side == "long":
-            return entry * 0.5
-        else:
-            return entry * 1.5
-    elif mode == "ENTRY":
-        # Stop bei Entry +/- Buffer
-        if side == "long":
-            return entry * (1 - buffer/100.0)
-        else:
-            return entry * (1 + buffer/100.0)
-    else:  # DCA3
-        # KORREKT: Long = DCA3 minus Buffer, Short = DCA3 plus Buffer
-        if side == "long":
-            return d3 * (1 - buffer/100.0)
-        else:
-            return d3 * (1 + buffer/100.0)
+    # Stop-Loss = DCA3 Distanz + Buffer
+    # Bei Long: Stop ist UNTER DCA3, also MEHR % vom Entry
+    # Bei Short: Stop ist ÜBER DCA3, also MEHR % vom Entry
+    stop_percentage = dca3_dist + SL_BUFFER_PCT
+    
+    return stop_percentage
 
 def build_altrady_open_payload(sig: dict) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
@@ -303,17 +282,29 @@ def build_altrady_open_payload(sig: dict) -> dict:
     d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
 
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
-
-    # Stop-Loss PREIS berechnen
-    stop_price = compute_stop_price(side, entry, d3)
+    
+    # Stop-Loss PROZENT berechnen
+    stop_percentage = compute_stop_loss_percentage(side, entry, d3)
     
     print(f"\n📊 {base} {side.upper()}")
-    print(f"   Entry: ${entry}")
-    print(f"   TPs: ${tp1} | ${tp2} | ${tp3}")
-    print(f"   DCAs: ${d1} | ${d2} | ${d3}")
-    print(f"   SL: ${stop_price} (Buffer: {SL_BUFFER_PCT}%)")
+    print(f"   Entry: ${entry:.4f}")
+    print(f"   TPs: ${tp1:.4f} | ${tp2:.4f} | ${tp3:.4f}")
+    print(f"   DCAs: ${d1:.4f} | ${d2:.4f} | ${d3:.4f}")
     
-    # Take Profits - SIMPLE PREISE
+    # Zeige Stop-Loss Berechnung
+    dca3_dist = abs((d3 - entry) / entry) * 100.0
+    print(f"   DCA3 Distanz: {dca3_dist:.1f}%")
+    print(f"   + Buffer: {SL_BUFFER_PCT}%")
+    print(f"   = Stop-Loss: {stop_percentage:.1f}% vom Entry")
+    
+    if side == "long":
+        actual_stop = entry * (1 - stop_percentage/100)
+        print(f"   → Stop bei: ${actual_stop:.4f}")
+    else:
+        actual_stop = entry * (1 + stop_percentage/100)
+        print(f"   → Stop bei: ${actual_stop:.4f}")
+    
+    # Take Profits
     take_profits = [
         {"price": tp1, "position_percentage": TP1_PCT},
         {"price": tp2, "position_percentage": TP2_PCT},
@@ -332,15 +323,16 @@ def build_altrady_open_payload(sig: dict) -> dict:
             "position_percentage": RUNNER_PCT,
             "trailing_distance": RUNNER_TRAILING_DIST
         })
+        print(f"   Runner: ${runner_price:.4f} mit {RUNNER_TRAILING_DIST}% trailing")
 
-    # DCAs - SIMPLE PREISE
+    # DCAs
     dca_orders = [
         {"price": d1, "quantity_percentage": DCA1_QTY_PCT},
         {"price": d2, "quantity_percentage": DCA2_QTY_PCT},
         {"price": d3, "quantity_percentage": DCA3_QTY_PCT}
     ]
 
-    # FINALER PAYLOAD - EXAKT WIE DEIN FUNKTIONIERENDES BEISPIEL
+    # FINALER PAYLOAD - MIT PROZENT STOP-LOSS
     payload = {
         "api_key": ALTRADY_API_KEY,
         "api_secret": ALTRADY_API_SECRET,
@@ -349,12 +341,12 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "symbol": symbol,
         "side": side,
         "order_type": "limit",
-        "signal_price": entry,  # NUR DER PREIS
+        "signal_price": entry,
         "leverage": FIXED_LEVERAGE,
         "take_profit": take_profits,
         "stop_loss": {
-            "stop_price": stop_price,  # NUR DER PREIS
-            "protection_type": "FOLLOW_TAKE_PROFIT"  # HARDCODED STRING
+            "stop_percentage": stop_percentage,  # ✅ PROZENT VOM ENTRY
+            "protection_type": "FOLLOW_TAKE_PROFIT"  # ✅ SL-to-Breakeven nach TP1
         },
         "dca_orders": dca_orders,
         "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
@@ -366,10 +358,6 @@ def build_altrady_open_payload(sig: dict) -> dict:
 # HTTP
 # =========================
 def post_to_altrady(payload: dict):
-    # DEBUG Output
-    print(f"\n📦 DEBUG PAYLOAD:")
-    print(f"   Symbol: {payload.get('symbol')}")
-    print(f"   Stop-Loss: {payload.get('stop_loss')}")
     print("   📤 Sende an Altrady...")
     
     for attempt in range(3):
@@ -385,7 +373,7 @@ def post_to_altrady(payload: dict):
                 continue
             
             if r.status_code == 204:
-                print("   ✅ Erfolg!")
+                print("   ✅ Erfolg! Order erstellt.")
                 return r
             
             r.raise_for_status()
@@ -402,12 +390,13 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot v2.1")
+    print("🚀 Discord → Altrady Bot v2.2 FINAL")
     print("="*50)
     print(f"Exchange: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
-    print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}+{RUNNER_PCT}%")
+    print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
     print(f"DCAs: {DCA1_QTY_PCT}/{DCA2_QTY_PCT}/{DCA3_QTY_PCT}%")
-    print(f"SL-Buffer: {SL_BUFFER_PCT}% | Mode: {BASE_STOP_MODE}")
+    print(f"Stop-Loss: DCA3 + {SL_BUFFER_PCT}% Buffer")
+    print(f"Protection: {STOP_PROTECTION_TYPE}")
     print("-"*50)
 
     state = load_state()
@@ -432,7 +421,7 @@ def main():
             max_seen = int(last_id or 0)
 
             if not msgs_sorted:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Warte...")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Warte auf Signale...")
             else:
                 for m in msgs_sorted:
                     mid = int(m.get("id","0"))
