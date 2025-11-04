@@ -261,12 +261,13 @@ def parse_signal_from_text(txt: str):
     }
 
 # =========================
-# Altrady Payload
+# Altrady Payload - HIER DER FIX!
 # =========================
 def pct_dist(entry: float, price: float) -> float:
     return abs((price - entry) / entry) * 100.0
 
-def compute_base_stop_percentage(side: str, entry: float, d3: float) -> float:
+def compute_stop_price(side: str, entry: float, d3: float) -> float:
+    """NEUER FIX: Berechnet STOP PREIS statt Prozent!"""
     mode = BASE_STOP_MODE
     dca3_dist = pct_dist(entry, d3)
     
@@ -278,13 +279,23 @@ def compute_base_stop_percentage(side: str, entry: float, d3: float) -> float:
         buffer = SL_BUFFER_PCT
     
     if mode == "NONE":
-        return 50.0
+        # Extremer Stop bei 50%
+        if side == "long":
+            return entry * 0.5
+        else:
+            return entry * 1.5
     elif mode == "ENTRY":
-        sl_price = entry * (1 - buffer/100.0) if side == "long" else entry * (1 + buffer/100.0)
+        # Stop bei Entry +/- Buffer
+        if side == "long":
+            return entry * (1 - buffer/100.0)
+        else:
+            return entry * (1 + buffer/100.0)
     else:  # DCA3
-        sl_price = d3 * (1 - buffer/100.0) if side == "long" else d3 * (1 + buffer/100.0)
-    
-    return pct_dist(entry, sl_price)
+        # Stop bei DCA3 +/- Buffer
+        if side == "long":
+            return d3 * (1 - buffer/100.0)
+        else:
+            return d3 * (1 + buffer/100.0)
 
 def build_altrady_open_payload(sig: dict) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
@@ -293,39 +304,47 @@ def build_altrady_open_payload(sig: dict) -> dict:
 
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
-    tp1_pct  = pct_dist(entry, tp1)
-    tp2_pct  = pct_dist(entry, tp2)
-    tp3_pct  = pct_dist(entry, tp3)
-    dca1_pct = pct_dist(entry, d1)
-    dca2_pct = pct_dist(entry, d2)
-    dca3_pct = pct_dist(entry, d3)
-
-    base_stop_pct = compute_base_stop_percentage(side, entry, d3)
+    # NEUER FIX: Stop als PREIS berechnen
+    stop_price = compute_stop_price(side, entry, d3)
     
     print(f"\n📊 {base} {side.upper()}")
     print(f"   Entry: ${entry:.10f}")
-    print(f"   TPs: {tp1_pct:.1f}% | {tp2_pct:.1f}% | {tp3_pct:.1f}%")
-    print(f"   DCAs: {dca1_pct:.1f}% | {dca2_pct:.1f}% | {dca3_pct:.1f}%")
-    print(f"   SL: {base_stop_pct:.1f}%")
+    print(f"   TPs: ${tp1:.10f} | ${tp2:.10f} | ${tp3:.10f}")
+    print(f"   DCAs: ${d1:.10f} | ${d2:.10f} | ${d3:.10f}")
+    print(f"   SL: ${stop_price:.10f}")
     
+    # NEUER FIX: Stop mit PREIS statt Prozent!
     stop_loss_obj = {
-        "stop_percentage": float(f"{base_stop_pct:.6f}"),
+        "stop_price": float(f"{stop_price:.10f}"),  # PREIS statt stop_percentage!
         "protection_type": STOP_PROTECTION_TYPE
     }
 
+    # NEUER FIX: Take Profits auch mit PREISEN!
     take_profits = [
-        {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
-        {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
-        {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT}
+        {"price": float(f"{tp1:.10f}"), "position_percentage": TP1_PCT},
+        {"price": float(f"{tp2:.10f}"), "position_percentage": TP2_PCT},
+        {"price": float(f"{tp3:.10f}"), "position_percentage": TP3_PCT}
     ]
     
+    # Runner mit Trailing (auch mit PREIS)
     if RUNNER_PCT > 0:
-        runner_tp_pct = tp3_pct * RUNNER_TP_MULTIPLIER
+        if side == "long":
+            runner_price = tp3 * RUNNER_TP_MULTIPLIER
+        else:
+            runner_price = tp3 / RUNNER_TP_MULTIPLIER
+            
         take_profits.append({
-            "price_percentage": float(f"{runner_tp_pct:.6f}"),
+            "price": float(f"{runner_price:.10f}"),
             "position_percentage": RUNNER_PCT,
             "trailing_distance": RUNNER_TRAILING_DIST
         })
+
+    # NEUER FIX: DCAs auch mit PREISEN!
+    dca_orders = [
+        {"price": float(f"{d1:.10f}"), "quantity_percentage": DCA1_QTY_PCT},
+        {"price": float(f"{d2:.10f}"), "quantity_percentage": DCA2_QTY_PCT},
+        {"price": float(f"{d3:.10f}"), "quantity_percentage": DCA3_QTY_PCT},
+    ]
 
     payload = {
         "action": "open",
@@ -338,12 +357,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "signal_price": float(f"{entry:.10f}"),
         "leverage": FIXED_LEVERAGE,
         
-        "dca_orders": [
-            {"price_percentage": float(f"{dca1_pct:.6f}"), "quantity_percentage": DCA1_QTY_PCT},
-            {"price_percentage": float(f"{dca2_pct:.6f}"), "quantity_percentage": DCA2_QTY_PCT},
-            {"price_percentage": float(f"{dca3_pct:.6f}"), "quantity_percentage": DCA3_QTY_PCT},
-        ],
-        
+        "dca_orders": dca_orders,
         "take_profit": take_profits,
         "stop_loss": stop_loss_obj,
         "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
