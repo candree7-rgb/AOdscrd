@@ -38,7 +38,7 @@ RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))
 # Stop-Loss Protection
 STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()
 BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()
-SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "5.0"))
+SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "3.5"))
 
 # DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
@@ -261,13 +261,13 @@ def parse_signal_from_text(txt: str):
     }
 
 # =========================
-# Altrady Payload - HIER DER FIX!
+# Altrady Payload - FINALER FIX
 # =========================
 def pct_dist(entry: float, price: float) -> float:
     return abs((price - entry) / entry) * 100.0
 
 def compute_stop_price(side: str, entry: float, d3: float) -> float:
-    """NEUER FIX: Berechnet STOP PREIS statt Prozent!"""
+    """Berechnet Stop-Loss PREIS basierend auf DCA3 +/- Buffer%"""
     mode = BASE_STOP_MODE
     dca3_dist = pct_dist(entry, d3)
     
@@ -291,7 +291,7 @@ def compute_stop_price(side: str, entry: float, d3: float) -> float:
         else:
             return entry * (1 + buffer/100.0)
     else:  # DCA3
-        # Stop bei DCA3 +/- Buffer
+        # KORREKT: Long = DCA3 minus Buffer, Short = DCA3 plus Buffer
         if side == "long":
             return d3 * (1 - buffer/100.0)
         else:
@@ -304,29 +304,23 @@ def build_altrady_open_payload(sig: dict) -> dict:
 
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
 
-    # NEUER FIX: Stop als PREIS berechnen
+    # Stop-Loss PREIS berechnen
     stop_price = compute_stop_price(side, entry, d3)
     
     print(f"\n📊 {base} {side.upper()}")
-    print(f"   Entry: ${entry:.10f}")
-    print(f"   TPs: ${tp1:.10f} | ${tp2:.10f} | ${tp3:.10f}")
-    print(f"   DCAs: ${d1:.10f} | ${d2:.10f} | ${d3:.10f}")
-    print(f"   SL: ${stop_price:.10f}")
+    print(f"   Entry: ${entry}")
+    print(f"   TPs: ${tp1} | ${tp2} | ${tp3}")
+    print(f"   DCAs: ${d1} | ${d2} | ${d3}")
+    print(f"   SL: ${stop_price} (Buffer: {SL_BUFFER_PCT}%)")
     
-    # NEUER FIX: Stop mit PREIS statt Prozent!
-    stop_loss_obj = {
-        "stop_price": float(f"{stop_price:.10f}"),  # PREIS statt stop_percentage!
-        "protection_type": STOP_PROTECTION_TYPE
-    }
-
-    # NEUER FIX: Take Profits auch mit PREISEN!
+    # Take Profits - SIMPLE PREISE
     take_profits = [
-        {"price": float(f"{tp1:.10f}"), "position_percentage": TP1_PCT},
-        {"price": float(f"{tp2:.10f}"), "position_percentage": TP2_PCT},
-        {"price": float(f"{tp3:.10f}"), "position_percentage": TP3_PCT}
+        {"price": tp1, "position_percentage": TP1_PCT},
+        {"price": tp2, "position_percentage": TP2_PCT},
+        {"price": tp3, "position_percentage": TP3_PCT}
     ]
     
-    # Runner mit Trailing (auch mit PREIS)
+    # Runner (optional)
     if RUNNER_PCT > 0:
         if side == "long":
             runner_price = tp3 * RUNNER_TP_MULTIPLIER
@@ -334,32 +328,35 @@ def build_altrady_open_payload(sig: dict) -> dict:
             runner_price = tp3 / RUNNER_TP_MULTIPLIER
             
         take_profits.append({
-            "price": float(f"{runner_price:.10f}"),
+            "price": runner_price,
             "position_percentage": RUNNER_PCT,
             "trailing_distance": RUNNER_TRAILING_DIST
         })
 
-    # NEUER FIX: DCAs auch mit PREISEN!
+    # DCAs - SIMPLE PREISE
     dca_orders = [
-        {"price": float(f"{d1:.10f}"), "quantity_percentage": DCA1_QTY_PCT},
-        {"price": float(f"{d2:.10f}"), "quantity_percentage": DCA2_QTY_PCT},
-        {"price": float(f"{d3:.10f}"), "quantity_percentage": DCA3_QTY_PCT},
+        {"price": d1, "quantity_percentage": DCA1_QTY_PCT},
+        {"price": d2, "quantity_percentage": DCA2_QTY_PCT},
+        {"price": d3, "quantity_percentage": DCA3_QTY_PCT}
     ]
 
+    # FINALER PAYLOAD - EXAKT WIE DEIN FUNKTIONIERENDES BEISPIEL
     payload = {
-        "action": "open",
         "api_key": ALTRADY_API_KEY,
         "api_secret": ALTRADY_API_SECRET,
         "exchange": ALTRADY_EXCHANGE,
+        "action": "open",
         "symbol": symbol,
         "side": side,
         "order_type": "limit",
-        "signal_price": float(f"{entry:.10f}"),
+        "signal_price": entry,  # NUR DER PREIS
         "leverage": FIXED_LEVERAGE,
-        
-        "dca_orders": dca_orders,
         "take_profit": take_profits,
-        "stop_loss": stop_loss_obj,
+        "stop_loss": {
+            "stop_price": stop_price,  # NUR DER PREIS
+            "protection_type": "FOLLOW_TAKE_PROFIT"  # HARDCODED STRING
+        },
+        "dca_orders": dca_orders,
         "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
     }
     
@@ -369,7 +366,11 @@ def build_altrady_open_payload(sig: dict) -> dict:
 # HTTP
 # =========================
 def post_to_altrady(payload: dict):
-    print("   📤 → Altrady...")
+    # DEBUG Output
+    print(f"\n📦 DEBUG PAYLOAD:")
+    print(f"   Symbol: {payload.get('symbol')}")
+    print(f"   Stop-Loss: {payload.get('stop_loss')}")
+    print("   📤 Sende an Altrady...")
     
     for attempt in range(3):
         try:
@@ -401,11 +402,12 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot")
+    print("🚀 Discord → Altrady Bot v2.1")
     print("="*50)
     print(f"Exchange: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
     print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}+{RUNNER_PCT}%")
     print(f"DCAs: {DCA1_QTY_PCT}/{DCA2_QTY_PCT}/{DCA3_QTY_PCT}%")
+    print(f"SL-Buffer: {SL_BUFFER_PCT}% | Mode: {BASE_STOP_MODE}")
     print("-"*50)
 
     state = load_state()
