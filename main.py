@@ -32,12 +32,12 @@ TP3_PCT             = float(os.getenv("TP3_PCT", "30"))
 RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 
 # Trailing für Runner
-RUNNER_TRAILING_DIST = float(os.getenv("RUNNER_TRAILING_DIST", "1.5"))  
-RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))  
+RUNNER_TRAILING_DIST = float(os.getenv("RUNNER_TRAILING_DIST", "1.5"))
+RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))
 
 # Stop-Loss Protection
 STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()
-BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()
+BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()  # (nur Info-Ausgabe)
 SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "3.5"))
 
 # DCA Größen (% der Start-Positionsgröße)
@@ -45,17 +45,20 @@ DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
 DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "225"))
 DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
 
-# Fallback DCA-Distanzen
+# Fallback DCA-Distanzen (vom Entry, in %)
 DCA1_DIST_PCT       = float(os.getenv("DCA1_DIST_PCT", "5"))
 DCA2_DIST_PCT       = float(os.getenv("DCA2_DIST_PCT", "10"))
 DCA3_DIST_PCT       = float(os.getenv("DCA3_DIST_PCT", "20"))
 
-# Limit-Order Ablauf
+# Limit-Order Ablauf (Zeit)
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "180"))
 
-# NEU: Entry Condition Settings
-ENTRY_WAIT_MINUTES  = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))  # 0 = keine Zeit-Bedingung
-TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"  # Für Tests
+# Entry-Condition
+ENTRY_WAIT_MINUTES  = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))            # 0 = keine Zeit-Bedingung
+ENTRY_TRIGGER_BUFFER_PCT = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT", "0.0"))  # NEU
+ENTRY_EXPIRATION_PRICE_PCT = float(os.getenv("ENTRY_EXPIRATION_PRICE_PCT", "0.0"))  # NEU
+
+TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"    # Für Tests
 
 # Poll-Steuerung
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
@@ -64,6 +67,9 @@ POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
 
 DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "50"))
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
+
+# Cooldown nach Order-Open (NEU)
+COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "0"))  # 0 = aus
 
 # =========================
 # Startup Checks
@@ -78,7 +84,7 @@ if not ALTRADY_API_KEY or not ALTRADY_API_SECRET:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady/2.0"
+    "User-Agent": "DiscordToAltrady/2.3"
 }
 
 # =========================
@@ -90,7 +96,8 @@ def load_state():
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except:
             pass
-    return {"last_id": None}
+    # last_trade_ts für Cooldown
+    return {"last_id": None, "last_trade_ts": 0.0}
 
 def save_state(st: dict):
     tmp = STATE_FILE.with_suffix(".json.tmp")
@@ -243,18 +250,16 @@ def parse_signal_from_text(txt: str):
     base, side = find_base_side(txt)
     if not base or not side:
         return None
-    
+
     entry = find_entry(txt)
     if entry is None:
         return None
 
     (tp1, tp2, tp3), (d1, d2, d3) = find_tp_dca(txt)
-
     if None in (tp1, tp2, tp3):
         return None
 
     d1, d2, d3 = backfill_dcas_if_missing(side, entry, [d1, d2, d3])
-
     if not plausible(side, entry, tp1, tp2, tp3, d1, d2, d3):
         return None
 
@@ -265,18 +270,11 @@ def parse_signal_from_text(txt: str):
     }
 
 # =========================
-# Altrady Payload - MIT ENTRY CONDITION FIX
+# Altrady Payload
 # =========================
-def compute_stop_loss_percentage(side: str, entry: float, d3: float) -> float:
-    """Berechnet Stop-Loss PROZENT vom Entry basierend auf DCA3 + Buffer"""
-    
-    # Berechne Distanz von Entry zu DCA3
+def compute_stop_loss_percentage(entry: float, d3: float) -> float:
     dca3_dist = abs((d3 - entry) / entry) * 100.0
-    
-    # Stop-Loss = DCA3 Distanz + Buffer
-    stop_percentage = dca3_dist + SL_BUFFER_PCT
-    
-    return stop_percentage
+    return dca3_dist + SL_BUFFER_PCT
 
 def build_altrady_open_payload(sig: dict) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
@@ -284,57 +282,38 @@ def build_altrady_open_payload(sig: dict) -> dict:
     d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
 
     symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
-    
-    # Stop-Loss PROZENT berechnen
-    stop_percentage = compute_stop_loss_percentage(side, entry, d3)
-    
-    print(f"\n📊 {base} {side.upper()}")
-    print(f"   Entry: ${entry:.4f}")
-    print(f"   TPs: ${tp1:.4f} | ${tp2:.4f} | ${tp3:.4f}")
-    print(f"   DCAs: ${d1:.4f} | ${d2:.4f} | ${d3:.4f}")
-    
-    # Zeige Stop-Loss Berechnung
-    dca3_dist = abs((d3 - entry) / entry) * 100.0
-    print(f"   DCA3 Distanz: {dca3_dist:.1f}%")
-    print(f"   + Buffer: {SL_BUFFER_PCT}%")
-    print(f"   = Stop-Loss: {stop_percentage:.1f}% vom Entry")
-    
+    stop_percentage = compute_stop_loss_percentage(entry, d3)
+
+    # Entry-Trigger mit Buffer
     if side == "long":
-        actual_stop = entry * (1 - stop_percentage/100)
-        print(f"   → Stop bei: ${actual_stop:.4f}")
+        trigger_price = entry * (1.0 - ENTRY_TRIGGER_BUFFER_PCT/100.0)
+        expire_price  = entry * (1.0 - ENTRY_EXPIRATION_PRICE_PCT/100.0) if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
     else:
-        actual_stop = entry * (1 + stop_percentage/100)
-        print(f"   → Stop bei: ${actual_stop:.4f}")
-    
+        trigger_price = entry * (1.0 + ENTRY_TRIGGER_BUFFER_PCT/100.0)
+        expire_price  = entry * (1.0 + ENTRY_EXPIRATION_PRICE_PCT/100.0) if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
+
     # Take Profits
     take_profits = [
         {"price": tp1, "position_percentage": TP1_PCT},
         {"price": tp2, "position_percentage": TP2_PCT},
         {"price": tp3, "position_percentage": TP3_PCT}
     ]
-    
-    # Runner (optional)
+
+    # Runner optional
     if RUNNER_PCT > 0:
-        if side == "long":
-            runner_price = tp3 * RUNNER_TP_MULTIPLIER
-        else:
-            runner_price = tp3 / RUNNER_TP_MULTIPLIER
-            
+        runner_price = tp3 * RUNNER_TP_MULTIPLIER if side == "long" else tp3 / RUNNER_TP_MULTIPLIER
         take_profits.append({
             "price": runner_price,
             "position_percentage": RUNNER_PCT,
             "trailing_distance": RUNNER_TRAILING_DIST
         })
-        print(f"   Runner: ${runner_price:.4f} mit {RUNNER_TRAILING_DIST}% trailing")
 
-    # DCAs
     dca_orders = [
         {"price": d1, "quantity_percentage": DCA1_QTY_PCT},
         {"price": d2, "quantity_percentage": DCA2_QTY_PCT},
         {"price": d3, "quantity_percentage": DCA3_QTY_PCT}
     ]
 
-    # PAYLOAD MIT ENTRY CONDITION
     payload = {
         "api_key": ALTRADY_API_KEY,
         "api_secret": ALTRADY_API_SECRET,
@@ -343,36 +322,34 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "symbol": symbol,
         "side": side,
         "order_type": "limit",
-        "signal_price": entry,
+        "signal_price": entry,                  # Limit-Preis (Maker, wenn Markt über/unter uns ist)
         "leverage": FIXED_LEVERAGE,
-        
-        # 🎯 DER FIX: Entry Condition hinzufügen!
-        "entry_condition": {
-            "price": entry  # Wartet bis Preis den Entry erreicht
-        },
-        
+        "entry_condition": { "price": float(f"{trigger_price:.10f}") },  # wartet auf Trigger inkl. Buffer
         "take_profit": take_profits,
         "stop_loss": {
-            "stop_percentage": stop_percentage,
-            "protection_type": "FOLLOW_TAKE_PROFIT"
+            "stop_percentage": float(f"{stop_percentage:.6f}"),
+            "protection_type": STOP_PROTECTION_TYPE  # FOLLOW_TAKE_PROFIT oder BREAK_EVEN
         },
         "dca_orders": dca_orders,
-        "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
+        "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
-    
-    # Optional: Zeit-Bedingung
+
+    # optionale Preis-basierte Expiration zusätzlich zur Zeit
+    if expire_price is not None:
+        payload["entry_expiration"]["price"] = float(f"{expire_price:.10f}")
+
     if ENTRY_WAIT_MINUTES > 0:
         payload["entry_condition"]["time"] = ENTRY_WAIT_MINUTES
-        payload["entry_condition"]["operator"] = "OR"  # Trigger bei Preis ODER Zeit
-        print(f"   ⏰ Entry-Condition: Preis ${entry:.4f} ODER {ENTRY_WAIT_MINUTES} Minuten")
-    else:
-        print(f"   🎯 Entry-Condition: Wartet auf Preis ${entry:.4f}")
-    
-    # Test-Mode
+        payload["entry_condition"]["operator"] = "OR"  # Preis ODER Zeit
+
     if TEST_MODE:
         payload["test"] = True
-        print("   🧪 TEST MODE - Erstellt nur Pending Orders!")
-    
+
+    # Debug-Ausgabe
+    print(f"\n📊 {base} {side.upper()}  |  Entry {entry}")
+    print(f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
+          + (f" oder Preis {expire_price:.6f}" if expire_price else ""))
+    print(f"   SL = DCA3+{SL_BUFFER_PCT}%  → {stop_percentage:.2f}% vom Entry")
     return payload
 
 # =========================
@@ -380,7 +357,6 @@ def build_altrady_open_payload(sig: dict) -> dict:
 # =========================
 def post_to_altrady(payload: dict):
     print("   📤 Sende an Altrady...")
-    
     for attempt in range(3):
         try:
             r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
@@ -392,14 +368,13 @@ def post_to_altrady(payload: dict):
                     pass
                 time.sleep(delay + 0.25)
                 continue
-            
+
             if r.status_code == 204:
-                print("   ✅ Erfolg! Order wartet auf Entry-Trigger.")
+                print("   ✅ Erfolg! Pending order angelegt (wartet auf Trigger).")
                 return r
-            
+
             r.raise_for_status()
             return r
-            
         except Exception as e:
             if attempt == 2:
                 print(f"   ❌ Fehler: {e}")
@@ -411,21 +386,25 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot v2.3 mit Entry-Condition")
+    print("🚀 Discord → Altrady Bot v2.3+b (Entry-Buffer, Price-Expire, Cooldown)")
     print("="*50)
     print(f"Exchange: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
     print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
     print(f"DCAs: {DCA1_QTY_PCT}/{DCA2_QTY_PCT}/{DCA3_QTY_PCT}%")
-    print(f"Stop-Loss: DCA3 + {SL_BUFFER_PCT}% Buffer")
-    print(f"Protection: {STOP_PROTECTION_TYPE}")
-    print(f"Entry-Condition: AKTIVIERT (wartet auf Trigger-Preis)")
+    print(f"Stop-Loss: DCA3 + {SL_BUFFER_PCT}% Buffer  |  Protection: {STOP_PROTECTION_TYPE}")
+    print(f"Entry: Buffer {ENTRY_TRIGGER_BUFFER_PCT}% | Expire {ENTRY_EXPIRATION_MIN} min"
+          + (f" + Preis±{ENTRY_EXPIRATION_PRICE_PCT}%" if ENTRY_EXPIRATION_PRICE_PCT>0 else ""))
+    if COOLDOWN_SECONDS > 0:
+        print(f"Cooldown: {COOLDOWN_SECONDS}s")
     if TEST_MODE:
-        print(f"⚠️  TEST MODE AKTIVIERT!")
+        print("⚠️ TEST MODE aktiv")
     print("-"*50)
 
     state = load_state()
     last_id = state.get("last_id")
+    last_trade_ts = float(state.get("last_trade_ts", 0.0))
 
+    # Erststart: baseline auf aktuellste Message setzen (nicht rückwirkend)
     if last_id is None:
         try:
             page = fetch_messages_after(CHANNEL_ID, None, limit=1)
@@ -450,13 +429,20 @@ def main():
                 for m in msgs_sorted:
                     mid = int(m.get("id","0"))
                     raw = message_text(m)
-                    
+
+                    # Cooldown: blocke neue Orders kurz nach dem letzten Open
+                    if COOLDOWN_SECONDS > 0 and (time.time() - last_trade_ts) < COOLDOWN_SECONDS:
+                        max_seen = max(max_seen, mid)
+                        continue
+
                     if raw:
                         sig = parse_signal_from_text(raw)
                         if sig:
                             payload = build_altrady_open_payload(sig)
                             post_to_altrady(payload)
-                    
+                            last_trade_ts = time.time()
+                            state["last_trade_ts"] = last_trade_ts
+
                     max_seen = max(max_seen, mid)
 
                 last_id = str(max_seen)
