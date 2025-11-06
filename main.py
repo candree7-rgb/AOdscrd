@@ -53,6 +53,10 @@ DCA3_DIST_PCT       = float(os.getenv("DCA3_DIST_PCT", "20"))
 # Limit-Order Ablauf
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "180"))
 
+# NEU: Entry Condition Settings
+ENTRY_WAIT_MINUTES  = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))  # 0 = keine Zeit-Bedingung
+TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"  # Für Tests
+
 # Poll-Steuerung
 POLL_BASE_SECONDS   = int(os.getenv("POLL_BASE_SECONDS", "60"))
 POLL_OFFSET_SECONDS = int(os.getenv("POLL_OFFSET_SECONDS", "3"))
@@ -261,7 +265,7 @@ def parse_signal_from_text(txt: str):
     }
 
 # =========================
-# Altrady Payload - FINAL MIT PROZENT
+# Altrady Payload - MIT ENTRY CONDITION FIX
 # =========================
 def compute_stop_loss_percentage(side: str, entry: float, d3: float) -> float:
     """Berechnet Stop-Loss PROZENT vom Entry basierend auf DCA3 + Buffer"""
@@ -270,8 +274,6 @@ def compute_stop_loss_percentage(side: str, entry: float, d3: float) -> float:
     dca3_dist = abs((d3 - entry) / entry) * 100.0
     
     # Stop-Loss = DCA3 Distanz + Buffer
-    # Bei Long: Stop ist UNTER DCA3, also MEHR % vom Entry
-    # Bei Short: Stop ist ÜBER DCA3, also MEHR % vom Entry
     stop_percentage = dca3_dist + SL_BUFFER_PCT
     
     return stop_percentage
@@ -332,7 +334,7 @@ def build_altrady_open_payload(sig: dict) -> dict:
         {"price": d3, "quantity_percentage": DCA3_QTY_PCT}
     ]
 
-    # FINALER PAYLOAD - MIT PROZENT STOP-LOSS
+    # PAYLOAD MIT ENTRY CONDITION
     payload = {
         "api_key": ALTRADY_API_KEY,
         "api_secret": ALTRADY_API_SECRET,
@@ -343,14 +345,33 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "order_type": "limit",
         "signal_price": entry,
         "leverage": FIXED_LEVERAGE,
+        
+        # 🎯 DER FIX: Entry Condition hinzufügen!
+        "entry_condition": {
+            "price": entry  # Wartet bis Preis den Entry erreicht
+        },
+        
         "take_profit": take_profits,
         "stop_loss": {
-            "stop_percentage": stop_percentage,  # ✅ PROZENT VOM ENTRY
-            "protection_type": "FOLLOW_TAKE_PROFIT"  # ✅ SL-to-Breakeven nach TP1
+            "stop_percentage": stop_percentage,
+            "protection_type": "FOLLOW_TAKE_PROFIT"
         },
         "dca_orders": dca_orders,
         "entry_expiration": {"time": ENTRY_EXPIRATION_MIN}
     }
+    
+    # Optional: Zeit-Bedingung
+    if ENTRY_WAIT_MINUTES > 0:
+        payload["entry_condition"]["time"] = ENTRY_WAIT_MINUTES
+        payload["entry_condition"]["operator"] = "OR"  # Trigger bei Preis ODER Zeit
+        print(f"   ⏰ Entry-Condition: Preis ${entry:.4f} ODER {ENTRY_WAIT_MINUTES} Minuten")
+    else:
+        print(f"   🎯 Entry-Condition: Wartet auf Preis ${entry:.4f}")
+    
+    # Test-Mode
+    if TEST_MODE:
+        payload["test"] = True
+        print("   🧪 TEST MODE - Erstellt nur Pending Orders!")
     
     return payload
 
@@ -373,7 +394,7 @@ def post_to_altrady(payload: dict):
                 continue
             
             if r.status_code == 204:
-                print("   ✅ Erfolg! Order erstellt.")
+                print("   ✅ Erfolg! Order wartet auf Entry-Trigger.")
                 return r
             
             r.raise_for_status()
@@ -390,13 +411,16 @@ def post_to_altrady(payload: dict):
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot v2.2 FINAL")
+    print("🚀 Discord → Altrady Bot v2.3 mit Entry-Condition")
     print("="*50)
     print(f"Exchange: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
     print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
     print(f"DCAs: {DCA1_QTY_PCT}/{DCA2_QTY_PCT}/{DCA3_QTY_PCT}%")
     print(f"Stop-Loss: DCA3 + {SL_BUFFER_PCT}% Buffer")
     print(f"Protection: {STOP_PROTECTION_TYPE}")
+    print(f"Entry-Condition: AKTIVIERT (wartet auf Trigger-Preis)")
+    if TEST_MODE:
+        print(f"⚠️  TEST MODE AKTIVIERT!")
     print("-"*50)
 
     state = load_state()
