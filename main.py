@@ -45,13 +45,13 @@ RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))
 
 # Stop-Loss Protection
 STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()
-BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()  # nur Info
+BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA2").strip().upper()  # Info-Only; jetzt DCA2
 SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "3.5"))
 
 # DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
 DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "225"))
-DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))
+DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))  # auf 0 setzen, um DCA3 komplett zu deaktivieren
 
 # Fallback DCA-Distanzen (vom Entry, in %)
 DCA1_DIST_PCT       = float(os.getenv("DCA1_DIST_PCT", "5"))
@@ -62,9 +62,9 @@ DCA3_DIST_PCT       = float(os.getenv("DCA3_DIST_PCT", "20"))
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "180"))
 
 # Entry-Condition
-ENTRY_WAIT_MINUTES         = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))            # 0 = keine Zeit-Bedingung
-ENTRY_TRIGGER_BUFFER_PCT   = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT", "0.0"))  # Trigger-Puffer
-ENTRY_EXPIRATION_PRICE_PCT = float(os.getenv("ENTRY_EXPIRATION_PRICE_PCT", "0.0"))# vorzeitiges Expire nach Preis
+ENTRY_WAIT_MINUTES         = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))             # 0 = keine Zeit-Bedingung
+ENTRY_TRIGGER_BUFFER_PCT   = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT", "0.0"))   # Trigger-Puffer
+ENTRY_EXPIRATION_PRICE_PCT = float(os.getenv("ENTRY_EXPIRATION_PRICE_PCT", "0.0")) # vorzeitiges Expire nach Preis
 
 TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"    # Für Tests
 
@@ -92,7 +92,7 @@ if not ALTRADY_API_KEY or not ALTRADY_API_SECRET:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady/2.4-multiwebhook"
+    "User-Agent": "DiscordToAltrady/2.5-multiwebhook"
 }
 
 # =========================
@@ -257,19 +257,15 @@ def parse_signal_from_text(txt: str):
     base, side = find_base_side(txt)
     if not base or not side:
         return None
-
     entry = find_entry(txt)
     if entry is None:
         return None
-
     (tp1, tp2, tp3), (d1, d2, d3) = find_tp_dca(txt)
     if None in (tp1, tp2, tp3):
         return None
-
     d1, d2, d3 = backfill_dcas_if_missing(side, entry, [d1, d2, d3])
     if not plausible(side, entry, tp1, tp2, tp3, d1, d2, d3):
         return None
-
     return {
         "base": base, "side": side, "entry": entry,
         "tp1": tp1, "tp2": tp2, "tp3": tp3,
@@ -279,9 +275,10 @@ def parse_signal_from_text(txt: str):
 # =========================
 # Altrady Payload
 # =========================
-def compute_stop_loss_percentage(entry: float, d3: float) -> float:
-    dca3_dist = abs((d3 - entry) / entry) * 100.0
-    return dca3_dist + SL_BUFFER_PCT
+def compute_stop_loss_percentage(entry: float, anchor_price: float) -> float:
+    """Stop-Loss % vom Entry, verankert auf anchor_price (z.B. DCA2) + Buffer."""
+    anchor_dist = abs((anchor_price - entry) / entry) * 100.0
+    return anchor_dist + SL_BUFFER_PCT
 
 def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str) -> dict:
     """Baut den Payload für EINEN Ziel-WebHook mit dessen Exchange + API-Creds."""
@@ -290,7 +287,9 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
     d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
 
     symbol = f"{exchange}_{QUOTE}_{base}"
-    stop_percentage = compute_stop_loss_percentage(entry, d3)
+
+    # SL an DCA2 + Buffer verankern
+    stop_percentage = compute_stop_loss_percentage(entry, d2)
 
     # Entry-Trigger mit Buffer
     if side == "long":
@@ -307,7 +306,7 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         {"price": tp3, "position_percentage": TP3_PCT}
     ]
 
-    # Runner optional
+    # Runner optional (TP4)
     if RUNNER_PCT > 0:
         runner_price = tp3 * RUNNER_TP_MULTIPLIER if side == "long" else tp3 / RUNNER_TP_MULTIPLIER
         take_profits.append({
@@ -316,11 +315,14 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
             "trailing_distance": RUNNER_TRAILING_DIST
         })
 
-    dca_orders = [
-        {"price": d1, "quantity_percentage": DCA1_QTY_PCT},
-        {"price": d2, "quantity_percentage": DCA2_QTY_PCT},
-        {"price": d3, "quantity_percentage": DCA3_QTY_PCT}
-    ]
+    # DCAs – DCA3 wird nur gesendet, wenn Menge > 0
+    dca_orders = []
+    if DCA1_QTY_PCT > 0:
+        dca_orders.append({"price": d1, "quantity_percentage": DCA1_QTY_PCT})
+    if DCA2_QTY_PCT > 0:
+        dca_orders.append({"price": d2, "quantity_percentage": DCA2_QTY_PCT})
+    if DCA3_QTY_PCT > 0:
+        dca_orders.append({"price": d3, "quantity_percentage": DCA3_QTY_PCT})
 
     payload = {
         "api_key": api_key,
@@ -352,11 +354,15 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
     if TEST_MODE:
         payload["test"] = True
 
-    # Kurz-Log für diesen Payload
+    # Kurz-Log
     print(f"\n📊 {base} {side.upper()}  |  {symbol}  |  Entry {entry}")
     print(f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
           + (f" oder Preis {expire_price:.6f}" if expire_price else ""))
-    print(f"   SL = DCA3+{SL_BUFFER_PCT}%  → {stop_percentage:.2f}% vom Entry")
+    print(f"   SL = DCA2+{SL_BUFFER_PCT}%  → {stop_percentage:.2f}% vom Entry")
+    if RUNNER_PCT > 0:
+        print(f"   Runner @ {runner_price:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
+    print(f"   DCAs: "
+          + ", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "   DCAs: –")
     return payload
 
 # =========================
@@ -406,14 +412,14 @@ def post_to_all_webhooks(payloads_and_urls: List[Tuple[str, dict]]):
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot v2.4 (Multi-Webhooks, Entry-Buffer, Price-Expire, Cooldown)")
+    print("🚀 Discord → Altrady Bot v2.5 (Multi-Webhooks, Entry-Buffer, Price-Expire, Cooldown, SL@DCA2)")
     print("="*50)
     print(f"Exchange #1: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
     if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
         print(f"Exchange #2: {ALTRADY_EXCHANGE_2}")
     print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
-    print(f"DCAs: {DCA1_QTY_PCT}/{DCA2_QTY_PCT}/{DCA3_QTY_PCT}%")
-    print(f"Stop-Loss: DCA3 + {SL_BUFFER_PCT}% Buffer  |  Protection: {STOP_PROTECTION_TYPE}")
+    print(f"DCAs: D1 {DCA1_QTY_PCT}%, D2 {DCA2_QTY_PCT}%, D3 {DCA3_QTY_PCT}%")
+    print(f"Stop-Loss: DCA2 + {SL_BUFFER_PCT}% Buffer  |  Protection: {STOP_PROTECTION_TYPE}")
     print(f"Entry: Buffer {ENTRY_TRIGGER_BUFFER_PCT}% | Expire {ENTRY_EXPIRATION_MIN} min"
           + (f" + Preis±{ENTRY_EXPIRATION_PRICE_PCT}%" if ENTRY_EXPIRATION_PRICE_PCT>0 else ""))
     if COOLDOWN_SECONDS > 0:
