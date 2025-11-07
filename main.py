@@ -4,7 +4,7 @@
 import os, re, sys, time, json, traceback, html, random
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 import requests
 from dotenv import load_dotenv
 
@@ -16,11 +16,19 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 CHANNEL_ID    = os.getenv("CHANNEL_ID", "").strip()
 
-ALTRADY_WEBHOOK_URL = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
-ALTRADY_API_KEY     = os.getenv("ALTRADY_API_KEY", "").strip()
-ALTRADY_API_SECRET  = os.getenv("ALTRADY_API_SECRET", "").strip()
-ALTRADY_EXCHANGE    = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()
-QUOTE               = os.getenv("QUOTE", "USDT").strip().upper()
+# Webhook #1
+ALTRADY_WEBHOOK_URL   = os.getenv("ALTRADY_WEBHOOK_URL", "").strip()
+ALTRADY_API_KEY       = os.getenv("ALTRADY_API_KEY", "").strip()
+ALTRADY_API_SECRET    = os.getenv("ALTRADY_API_SECRET", "").strip()
+ALTRADY_EXCHANGE      = os.getenv("ALTRADY_EXCHANGE", "BYBI").strip()
+
+# Optionaler Webhook #2 (eigene Creds/Exchange)
+ALTRADY_WEBHOOK_URL_2 = os.getenv("ALTRADY_WEBHOOK_URL_2", "").strip()
+ALTRADY_API_KEY_2     = os.getenv("ALTRADY_API_KEY_2", "").strip()
+ALTRADY_API_SECRET_2  = os.getenv("ALTRADY_API_SECRET_2", "").strip()
+ALTRADY_EXCHANGE_2    = os.getenv("ALTRADY_EXCHANGE_2", "").strip()
+
+QUOTE = os.getenv("QUOTE", "USDT").strip().upper()
 
 # Hebel
 FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
@@ -37,7 +45,7 @@ RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))
 
 # Stop-Loss Protection
 STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()
-BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()  # (nur Info-Ausgabe)
+BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA3").strip().upper()  # nur Info
 SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "3.5"))
 
 # DCA Größen (% der Start-Positionsgröße)
@@ -54,9 +62,9 @@ DCA3_DIST_PCT       = float(os.getenv("DCA3_DIST_PCT", "20"))
 ENTRY_EXPIRATION_MIN= int(os.getenv("ENTRY_EXPIRATION_MIN", "180"))
 
 # Entry-Condition
-ENTRY_WAIT_MINUTES  = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))            # 0 = keine Zeit-Bedingung
-ENTRY_TRIGGER_BUFFER_PCT = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT", "0.0"))  # NEU
-ENTRY_EXPIRATION_PRICE_PCT = float(os.getenv("ENTRY_EXPIRATION_PRICE_PCT", "0.0"))  # NEU
+ENTRY_WAIT_MINUTES         = int(os.getenv("ENTRY_WAIT_MINUTES", "0"))            # 0 = keine Zeit-Bedingung
+ENTRY_TRIGGER_BUFFER_PCT   = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT", "0.0"))  # Trigger-Puffer
+ENTRY_EXPIRATION_PRICE_PCT = float(os.getenv("ENTRY_EXPIRATION_PRICE_PCT", "0.0"))# vorzeitiges Expire nach Preis
 
 TEST_MODE           = os.getenv("TEST_MODE", "false").lower() == "true"    # Für Tests
 
@@ -68,7 +76,7 @@ POLL_JITTER_MAX     = int(os.getenv("POLL_JITTER_MAX", "7"))
 DISCORD_FETCH_LIMIT = int(os.getenv("DISCORD_FETCH_LIMIT", "50"))
 STATE_FILE          = Path(os.getenv("STATE_FILE", "state.json"))
 
-# Cooldown nach Order-Open (NEU)
+# Cooldown nach Order-Open
 COOLDOWN_SECONDS    = int(os.getenv("COOLDOWN_SECONDS", "0"))  # 0 = aus
 
 # =========================
@@ -84,7 +92,7 @@ if not ALTRADY_API_KEY or not ALTRADY_API_SECRET:
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
-    "User-Agent": "DiscordToAltrady/2.3"
+    "User-Agent": "DiscordToAltrady/2.4-multiwebhook"
 }
 
 # =========================
@@ -96,7 +104,6 @@ def load_state():
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except:
             pass
-    # last_trade_ts für Cooldown
     return {"last_id": None, "last_trade_ts": 0.0}
 
 def save_state(st: dict):
@@ -276,12 +283,13 @@ def compute_stop_loss_percentage(entry: float, d3: float) -> float:
     dca3_dist = abs((d3 - entry) / entry) * 100.0
     return dca3_dist + SL_BUFFER_PCT
 
-def build_altrady_open_payload(sig: dict) -> dict:
+def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str) -> dict:
+    """Baut den Payload für EINEN Ziel-WebHook mit dessen Exchange + API-Creds."""
     base, side, entry = sig["base"], sig["side"], sig["entry"]
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
     d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
 
-    symbol = f"{ALTRADY_EXCHANGE}_{QUOTE}_{base}"
+    symbol = f"{exchange}_{QUOTE}_{base}"
     stop_percentage = compute_stop_loss_percentage(entry, d3)
 
     # Entry-Trigger mit Buffer
@@ -315,14 +323,14 @@ def build_altrady_open_payload(sig: dict) -> dict:
     ]
 
     payload = {
-        "api_key": ALTRADY_API_KEY,
-        "api_secret": ALTRADY_API_SECRET,
-        "exchange": ALTRADY_EXCHANGE,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "exchange": exchange,
         "action": "open",
         "symbol": symbol,
         "side": side,
         "order_type": "limit",
-        "signal_price": entry,                  # Limit-Preis (Maker, wenn Markt über/unter uns ist)
+        "signal_price": entry,                  # Limit-Preis (Maker)
         "leverage": FIXED_LEVERAGE,
         "entry_condition": { "price": float(f"{trigger_price:.10f}") },  # wartet auf Trigger inkl. Buffer
         "take_profit": take_profits,
@@ -334,7 +342,6 @@ def build_altrady_open_payload(sig: dict) -> dict:
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
     }
 
-    # optionale Preis-basierte Expiration zusätzlich zur Zeit
     if expire_price is not None:
         payload["entry_expiration"]["price"] = float(f"{expire_price:.10f}")
 
@@ -345,21 +352,21 @@ def build_altrady_open_payload(sig: dict) -> dict:
     if TEST_MODE:
         payload["test"] = True
 
-    # Debug-Ausgabe
-    print(f"\n📊 {base} {side.upper()}  |  Entry {entry}")
+    # Kurz-Log für diesen Payload
+    print(f"\n📊 {base} {side.upper()}  |  {symbol}  |  Entry {entry}")
     print(f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
           + (f" oder Preis {expire_price:.6f}" if expire_price else ""))
     print(f"   SL = DCA3+{SL_BUFFER_PCT}%  → {stop_percentage:.2f}% vom Entry")
     return payload
 
 # =========================
-# HTTP
+# HTTP (pro Webhook)
 # =========================
-def post_to_altrady(payload: dict):
-    print("   📤 Sende an Altrady...")
+def _post_one(url: str, payload: dict):
+    print(f"   📤 Sende an {url} ...")
     for attempt in range(3):
         try:
-            r = requests.post(ALTRADY_WEBHOOK_URL, json=payload, timeout=20)
+            r = requests.post(url, json=payload, timeout=20)
             if r.status_code == 429:
                 delay = 2.0
                 try:
@@ -374,21 +381,36 @@ def post_to_altrady(payload: dict):
                 return r
 
             r.raise_for_status()
+            print("   ✅ Erfolg!")
             return r
         except Exception as e:
             if attempt == 2:
-                print(f"   ❌ Fehler: {e}")
+                print(f"   ❌ Fehler bei {url}: {e}")
                 raise
             time.sleep(1.5 * (attempt + 1))
+
+def post_to_all_webhooks(payloads_and_urls: List[Tuple[str, dict]]):
+    """payloads_and_urls: Liste von (url, payload) – wird nacheinander gesendet."""
+    last_resp = None
+    for i, (url, payload) in enumerate(payloads_and_urls, 1):
+        print(f"→ Webhook #{i} von {len(payloads_and_urls)}")
+        try:
+            last_resp = _post_one(url, payload)
+        except Exception as e:
+            print(f"   ⚠️ Weiter mit nächstem Webhook (Fehler: {e})")
+            continue
+    return last_resp
 
 # =========================
 # Main
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot v2.3+b (Entry-Buffer, Price-Expire, Cooldown)")
+    print("🚀 Discord → Altrady Bot v2.4 (Multi-Webhooks, Entry-Buffer, Price-Expire, Cooldown)")
     print("="*50)
-    print(f"Exchange: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
+    print(f"Exchange #1: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
+    if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
+        print(f"Exchange #2: {ALTRADY_EXCHANGE_2}")
     print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
     print(f"DCAs: {DCA1_QTY_PCT}/{DCA2_QTY_PCT}/{DCA3_QTY_PCT}%")
     print(f"Stop-Loss: DCA3 + {SL_BUFFER_PCT}% Buffer  |  Protection: {STOP_PROTECTION_TYPE}")
@@ -398,6 +420,9 @@ def main():
         print(f"Cooldown: {COOLDOWN_SECONDS}s")
     if TEST_MODE:
         print("⚠️ TEST MODE aktiv")
+
+    active_webhooks = 1 + int(bool(ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2))
+    print(f"Webhooks aktiv: {active_webhooks}")
     print("-"*50)
 
     state = load_state()
@@ -438,8 +463,16 @@ def main():
                     if raw:
                         sig = parse_signal_from_text(raw)
                         if sig:
-                            payload = build_altrady_open_payload(sig)
-                            post_to_altrady(payload)
+                            # Payload #1
+                            p1 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE, ALTRADY_API_KEY, ALTRADY_API_SECRET)
+                            jobs = [(ALTRADY_WEBHOOK_URL, p1)]
+
+                            # Payload #2 (nur wenn alles Nötige gesetzt ist)
+                            if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
+                                p2 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE_2, ALTRADY_API_KEY_2, ALTRADY_API_SECRET_2)
+                                jobs.append((ALTRADY_WEBHOOK_URL_2, p2))
+
+                            post_to_all_webhooks(jobs)
                             last_trade_ts = time.time()
                             state["last_trade_ts"] = last_trade_ts
 
