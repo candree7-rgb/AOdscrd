@@ -31,7 +31,7 @@ ALTRADY_EXCHANGE_2    = os.getenv("ALTRADY_EXCHANGE_2", "").strip()
 QUOTE = os.getenv("QUOTE", "USDT").strip().upper()
 
 # Hebel
-FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "25"))
+FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "5"))
 
 # TP-Split (30/30/30) + Runner (10% via SL/Trail abgesichert)
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
@@ -43,15 +43,19 @@ RUNNER_PCT          = float(os.getenv("RUNNER_PCT", "10"))
 RUNNER_TRAILING_DIST = float(os.getenv("RUNNER_TRAILING_DIST", "1.5"))
 RUNNER_TP_MULTIPLIER = float(os.getenv("RUNNER_TP_MULTIPLIER", "1.5"))
 
-# Stop-Loss Protection
-STOP_PROTECTION_TYPE = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()
-BASE_STOP_MODE       = os.getenv("BASE_STOP_MODE", "DCA2").strip().upper()  # Info-Only; jetzt DCA2
-SL_BUFFER_PCT        = float(os.getenv("SL_BUFFER_PCT", "3.5"))
+# Stop-Loss Modus
+# DCA1 (Default): SL = Distanz Entry->DCA1 + SL_BUFFER_PCT
+# DCA2:            SL = Distanz Entry->DCA2 + SL_BUFFER_PCT
+# FIXED:           SL = STOP_FIXED_PERCENTAGE (direkt, in %)
+STOP_PROTECTION_TYPE   = os.getenv("STOP_PROTECTION_TYPE", "FOLLOW_TAKE_PROFIT").strip().upper()
+BASE_STOP_MODE         = os.getenv("BASE_STOP_MODE", "DCA1").strip().upper()  # DCA1|DCA2|FIXED
+SL_BUFFER_PCT          = float(os.getenv("SL_BUFFER_PCT", "4.0"))
+STOP_FIXED_PERCENTAGE  = float(os.getenv("STOP_FIXED_PERCENTAGE", "9.0"))
 
 # DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
-DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "225"))
-DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "340"))  # auf 0 setzen, um DCA3 komplett zu deaktivieren
+DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "0"))    # Default: DCA1-only
+DCA3_QTY_PCT        = float(os.getenv("DCA3_QTY_PCT", "0"))    # Default: DCA1-only
 
 # Fallback DCA-Distanzen (vom Entry, in %)
 DCA1_DIST_PCT       = float(os.getenv("DCA1_DIST_PCT", "5"))
@@ -275,31 +279,33 @@ def parse_signal_from_text(txt: str):
 # =========================
 # Altrady Payload
 # =========================
-def compute_stop_loss_percentage(entry: float, anchor_price: float) -> float:
-    """Stop-Loss % vom Entry, verankert auf anchor_price (z.B. DCA2) + Buffer."""
+def _percent_from_entry(entry: float, target: float) -> float:
+    """Preis -> Prozent relativ zum Entry; >0 über Entry, <0 unter Entry."""
+    return (target / entry - 1.0) * 100.0
+
+def _compute_stop_percentage(entry: float, d1: float, d2: float) -> float:
+    mode = BASE_STOP_MODE
+    if mode == "FIXED":
+        return float(STOP_FIXED_PERCENTAGE)
+    anchor_price = None
+    if mode == "DCA2" and d2 is not None:
+        anchor_price = d2
+    else:
+        anchor_price = d1  # Default: DCA1
     anchor_dist = abs((anchor_price - entry) / entry) * 100.0
     return anchor_dist + SL_BUFFER_PCT
 
-def _pct_from_entry(entry: float, target: float) -> float:
-    """
-    Prozentabstand vom Entry zu 'target'.
-    > 0  = über Entry, < 0 = unter Entry. Für Long liegen TPs typ. >0, für Short <0.
-    Altrady interpretiert 'price_percentage' relativ zum (aktuellen/avg) Entry.
-    """
-    return (target / entry - 1.0) * 100.0
-
 def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str) -> dict:
-    """Baut den Payload für EINEN Ziel-WebHook mit dessen Exchange + API-Creds."""
     base, side, entry = sig["base"], sig["side"], sig["entry"]
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
     d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
 
     symbol = f"{exchange}_{QUOTE}_{base}"
 
-    # SL an DCA2 + Buffer verankern (prozentual vom ursprünglichen Entry)
-    stop_percentage = compute_stop_loss_percentage(entry, d2)
+    # Stop-Loss (in %)
+    stop_percentage = _compute_stop_percentage(entry, d1, d2)
 
-    # Entry-Trigger mit Buffer (weiterhin in Preis, weil Trigger ein Preis ist)
+    # Entry-Trigger bleibt Preis-basiert
     if side == "long":
         trigger_price = entry * (1.0 - ENTRY_TRIGGER_BUFFER_PCT/100.0)
         expire_price  = entry * (1.0 - ENTRY_EXPIRATION_PRICE_PCT/100.0) if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
@@ -307,35 +313,37 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         trigger_price = entry * (1.0 + ENTRY_TRIGGER_BUFFER_PCT/100.0)
         expire_price  = entry * (1.0 + ENTRY_EXPIRATION_PRICE_PCT/100.0) if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
 
-    # ---- Take Profits jetzt prozentual (folgen dem neuen Avg-Entry nach DCA)
-    tp1_pct = _pct_from_entry(entry, tp1)
-    tp2_pct = _pct_from_entry(entry, tp2)
-    tp3_pct = _pct_from_entry(entry, tp3)
+    # Take Profits als Prozent (folgen Avg-Entry nach DCA)
+    tp1_pct = _percent_from_entry(entry, tp1) if tp1 is not None else None
+    tp2_pct = _percent_from_entry(entry, tp2) if tp2 is not None else None
+    tp3_pct = _percent_from_entry(entry, tp3) if tp3 is not None else None
 
-    take_profits = [
-        {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
-        {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
-        {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT},
-    ]
+    take_profits = []
+    if tp1_pct is not None:
+        take_profits.append({"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT})
+    if tp2_pct is not None:
+        take_profits.append({"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT})
+    if tp3_pct is not None:
+        take_profits.append({"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT})
 
-    # Runner ebenfalls prozentual
+    # Runner prozentual (von TP3 aus weiter)
     runner_pct = None
-    if RUNNER_PCT > 0:
+    if RUNNER_PCT > 0 and tp3 is not None:
         runner_price = tp3 * RUNNER_TP_MULTIPLIER if side == "long" else tp3 / RUNNER_TP_MULTIPLIER
-        runner_pct = _pct_from_entry(entry, runner_price)
+        runner_pct = _percent_from_entry(entry, runner_price)
         take_profits.append({
             "price_percentage": float(f"{runner_pct:.6f}"),
             "position_percentage": RUNNER_PCT,
             "trailing_distance": RUNNER_TRAILING_DIST
         })
 
-    # DCAs – bleiben als fixe Preislevels (wie bisher)
+    # DCAs als fixe Preislevels (so wie Signale kommen)
     dca_orders = []
-    if DCA1_QTY_PCT > 0:
+    if DCA1_QTY_PCT > 0 and d1 is not None:
         dca_orders.append({"price": d1, "quantity_percentage": DCA1_QTY_PCT})
-    if DCA2_QTY_PCT > 0:
+    if DCA2_QTY_PCT > 0 and d2 is not None:
         dca_orders.append({"price": d2, "quantity_percentage": DCA2_QTY_PCT})
-    if DCA3_QTY_PCT > 0:
+    if DCA3_QTY_PCT > 0 and d3 is not None:
         dca_orders.append({"price": d3, "quantity_percentage": DCA3_QTY_PCT})
 
     payload = {
@@ -346,13 +354,13 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         "symbol": symbol,
         "side": side,
         "order_type": "limit",
-        "signal_price": entry,                  # Limit-Preis (Maker)
+        "signal_price": entry,
         "leverage": FIXED_LEVERAGE,
-        "entry_condition": { "price": float(f"{trigger_price:.10f}") },  # wartet auf Trigger inkl. Buffer
+        "entry_condition": { "price": float(f"{trigger_price:.10f}") },
         "take_profit": take_profits,
         "stop_loss": {
             "stop_percentage": float(f"{stop_percentage:.6f}"),
-            "protection_type": STOP_PROTECTION_TYPE  # FOLLOW_TAKE_PROFIT oder BREAK_EVEN
+            "protection_type": STOP_PROTECTION_TYPE
         },
         "dca_orders": dca_orders,
         "entry_expiration": { "time": ENTRY_EXPIRATION_MIN }
@@ -363,7 +371,7 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
 
     if ENTRY_WAIT_MINUTES > 0:
         payload["entry_condition"]["time"] = ENTRY_WAIT_MINUTES
-        payload["entry_condition"]["operator"] = "OR"  # Preis ODER Zeit
+        payload["entry_condition"]["operator"] = "OR"
 
     if TEST_MODE:
         payload["test"] = True
@@ -372,10 +380,10 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
     print(f"\n📊 {base} {side.upper()}  |  {symbol}  |  Entry {entry}")
     print(f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
           + (f" oder Preis {expire_price:.6f}" if expire_price else ""))
-    print(f"   SL = DCA2+{SL_BUFFER_PCT}%  → {stop_percentage:.2f}% vom Entry")
+    print(f"   SL-Modus: {BASE_STOP_MODE}  → {stop_percentage:.2f}% unter Entry")
     if RUNNER_PCT > 0 and runner_pct is not None:
         print(f"   Runner% ≈ {runner_pct:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
-    print("   DCAs: " + (", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "–"))
+    print("   DCAs: " + (", ".join([f\"{o['quantity_percentage']}%@{o['price']:.6f}\" for o in dca_orders]) if dca_orders else "–"))
     return payload
 
 # =========================
@@ -410,7 +418,6 @@ def _post_one(url: str, payload: dict):
             time.sleep(1.5 * (attempt + 1))
 
 def post_to_all_webhooks(payloads_and_urls: List[Tuple[str, dict]]):
-    """payloads_and_urls: Liste von (url, payload) – wird nacheinander gesendet."""
     last_resp = None
     for i, (url, payload) in enumerate(payloads_and_urls, 1):
         print(f"→ Webhook #{i} von {len(payloads_and_urls)}")
@@ -426,14 +433,15 @@ def post_to_all_webhooks(payloads_and_urls: List[Tuple[str, dict]]):
 # =========================
 def main():
     print("="*50)
-    print("🚀 Discord → Altrady Bot v2.5 (Multi-Webhooks, Entry-Buffer, Price-Expire, Cooldown, SL@DCA2)")
+    print("🚀 Discord → Altrady Bot v2.6 (Percent TPs, SL@DCA1 default, Runner)")
     print("="*50)
     print(f"Exchange #1: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
     if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
         print(f"Exchange #2: {ALTRADY_EXCHANGE_2}")
-    print(f"TPs: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
+    print(f"TP-Splits: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
     print(f"DCAs: D1 {DCA1_QTY_PCT}%, D2 {DCA2_QTY_PCT}%, D3 {DCA3_QTY_PCT}%")
-    print(f"Stop-Loss: DCA2 + {SL_BUFFER_PCT}% Buffer  |  Protection: {STOP_PROTECTION_TYPE}")
+    print(f"Stop: {BASE_STOP_MODE} + Buffer {SL_BUFFER_PCT}%"
+          + (f" | FIXED={STOP_FIXED_PERCENTAGE}%" if BASE_STOP_MODE=='FIXED' else ""))
     print(f"Entry: Buffer {ENTRY_TRIGGER_BUFFER_PCT}% | Expire {ENTRY_EXPIRATION_MIN} min"
           + (f" + Preis±{ENTRY_EXPIRATION_PRICE_PCT}%" if ENTRY_EXPIRATION_PRICE_PCT>0 else ""))
     if COOLDOWN_SECONDS > 0:
@@ -487,7 +495,7 @@ def main():
                             p1 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE, ALTRADY_API_KEY, ALTRADY_API_SECRET)
                             jobs = [(ALTRADY_WEBHOOK_URL, p1)]
 
-                            # Payload #2 (nur wenn alles Nötige gesetzt ist)
+                            # Payload #2 (optional)
                             if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
                                 p2 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE_2, ALTRADY_API_KEY_2, ALTRADY_API_SECRET_2)
                                 jobs.append((ALTRADY_WEBHOOK_URL_2, p2))
