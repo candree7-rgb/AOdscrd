@@ -280,6 +280,14 @@ def compute_stop_loss_percentage(entry: float, anchor_price: float) -> float:
     anchor_dist = abs((anchor_price - entry) / entry) * 100.0
     return anchor_dist + SL_BUFFER_PCT
 
+def _pct_from_entry(entry: float, target: float) -> float:
+    """
+    Prozentabstand vom Entry zu 'target'.
+    > 0  = über Entry, < 0 = unter Entry. Für Long liegen TPs typ. >0, für Short <0.
+    Altrady interpretiert 'price_percentage' relativ zum (aktuellen/avg) Entry.
+    """
+    return (target / entry - 1.0) * 100.0
+
 def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str) -> dict:
     """Baut den Payload für EINEN Ziel-WebHook mit dessen Exchange + API-Creds."""
     base, side, entry = sig["base"], sig["side"], sig["entry"]
@@ -288,10 +296,10 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
 
     symbol = f"{exchange}_{QUOTE}_{base}"
 
-    # SL an DCA2 + Buffer verankern
+    # SL an DCA2 + Buffer verankern (prozentual vom ursprünglichen Entry)
     stop_percentage = compute_stop_loss_percentage(entry, d2)
 
-    # Entry-Trigger mit Buffer
+    # Entry-Trigger mit Buffer (weiterhin in Preis, weil Trigger ein Preis ist)
     if side == "long":
         trigger_price = entry * (1.0 - ENTRY_TRIGGER_BUFFER_PCT/100.0)
         expire_price  = entry * (1.0 - ENTRY_EXPIRATION_PRICE_PCT/100.0) if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
@@ -299,23 +307,29 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         trigger_price = entry * (1.0 + ENTRY_TRIGGER_BUFFER_PCT/100.0)
         expire_price  = entry * (1.0 + ENTRY_EXPIRATION_PRICE_PCT/100.0) if ENTRY_EXPIRATION_PRICE_PCT > 0 else None
 
-    # Take Profits
+    # ---- Take Profits jetzt prozentual (folgen dem neuen Avg-Entry nach DCA)
+    tp1_pct = _pct_from_entry(entry, tp1)
+    tp2_pct = _pct_from_entry(entry, tp2)
+    tp3_pct = _pct_from_entry(entry, tp3)
+
     take_profits = [
-        {"price": tp1, "position_percentage": TP1_PCT},
-        {"price": tp2, "position_percentage": TP2_PCT},
-        {"price": tp3, "position_percentage": TP3_PCT}
+        {"price_percentage": float(f"{tp1_pct:.6f}"), "position_percentage": TP1_PCT},
+        {"price_percentage": float(f"{tp2_pct:.6f}"), "position_percentage": TP2_PCT},
+        {"price_percentage": float(f"{tp3_pct:.6f}"), "position_percentage": TP3_PCT},
     ]
 
-    # Runner optional (TP4)
+    # Runner ebenfalls prozentual
+    runner_pct = None
     if RUNNER_PCT > 0:
         runner_price = tp3 * RUNNER_TP_MULTIPLIER if side == "long" else tp3 / RUNNER_TP_MULTIPLIER
+        runner_pct = _pct_from_entry(entry, runner_price)
         take_profits.append({
-            "price": runner_price,
+            "price_percentage": float(f"{runner_pct:.6f}"),
             "position_percentage": RUNNER_PCT,
             "trailing_distance": RUNNER_TRAILING_DIST
         })
 
-    # DCAs – DCA3 wird nur gesendet, wenn Menge > 0
+    # DCAs – bleiben als fixe Preislevels (wie bisher)
     dca_orders = []
     if DCA1_QTY_PCT > 0:
         dca_orders.append({"price": d1, "quantity_percentage": DCA1_QTY_PCT})
@@ -359,10 +373,9 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
     print(f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
           + (f" oder Preis {expire_price:.6f}" if expire_price else ""))
     print(f"   SL = DCA2+{SL_BUFFER_PCT}%  → {stop_percentage:.2f}% vom Entry")
-    if RUNNER_PCT > 0:
-        print(f"   Runner @ {runner_price:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
-    print(f"   DCAs: "
-          + ", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "   DCAs: –")
+    if RUNNER_PCT > 0 and runner_pct is not None:
+        print(f"   Runner% ≈ {runner_pct:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
+    print("   DCAs: " + (", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "–"))
     return payload
 
 # =========================
@@ -376,7 +389,8 @@ def _post_one(url: str, payload: dict):
             if r.status_code == 429:
                 delay = 2.0
                 try:
-                    delay = float(r.json().get("retry_after", 2.0))
+                    if r.headers.get("Content-Type","").startswith("application/json"):
+                        delay = float(r.json().get("retry_after", 2.0))
                 except:
                     pass
                 time.sleep(delay + 0.25)
