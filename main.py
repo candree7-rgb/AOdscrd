@@ -379,12 +379,17 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
 
     # Kurz-Log
     print(f"\n📊 {base} {side.upper()}  |  {symbol}  |  Entry {entry}")
-    print(f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
-          + (f" oder Preis {expire_price:.6f}" if expire_price else ""))
+    print(
+        f"   Trigger @ {trigger_price:.6f}  |  Expire in {ENTRY_EXPIRATION_MIN} min"
+        + (f" oder Preis {expire_price:.6f}" if expire_price else "")
+    )
     print(f"   SL-Modus: {BASE_STOP_MODE}  → {stop_percentage:.2f}% unter Entry")
     if RUNNER_PCT > 0 and runner_pct is not None:
         print(f"   Runner% ≈ {runner_pct:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
-    print("   DCAs: " + (", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "–"))
+    print(
+        "   DCAs: "
+        + (", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "–")
+    )
     return payload
 
 # =========================
