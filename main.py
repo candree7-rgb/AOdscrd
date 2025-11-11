@@ -30,8 +30,9 @@ ALTRADY_EXCHANGE_2    = os.getenv("ALTRADY_EXCHANGE_2", "").strip()
 
 QUOTE = os.getenv("QUOTE", "USDT").strip().upper()
 
-# Hebel
-FIXED_LEVERAGE      = int(os.getenv("FIXED_LEVERAGE", "5"))
+# >>> NEU: getrennte Hebel je Webhook
+LEVERAGE_1 = int(os.getenv("LEVERAGE_1", "5"))
+LEVERAGE_2 = int(os.getenv("LEVERAGE_2", "10"))
 
 # TP-Split (30/30/30) + Runner (10% via SL/Trail abgesichert)
 TP1_PCT             = float(os.getenv("TP1_PCT", "30"))
@@ -295,7 +296,7 @@ def _compute_stop_percentage(entry: float, d1: float, d2: float) -> float:
     anchor_dist = abs((anchor_price - entry) / entry) * 100.0
     return anchor_dist + SL_BUFFER_PCT
 
-def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str) -> dict:
+def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secret: str, leverage: int) -> dict:
     base, side, entry = sig["base"], sig["side"], sig["entry"]
     tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
     d1, d2, d3 = sig["dca1"], sig["dca2"], sig["dca3"]
@@ -355,7 +356,7 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         "side": side,
         "order_type": "limit",
         "signal_price": entry,
-        "leverage": FIXED_LEVERAGE,
+        "leverage": leverage,  # <<— aus ENV je Webhook
         "entry_condition": { "price": float(f"{trigger_price:.10f}") },
         "take_profit": take_profits,
         "stop_loss": {
@@ -383,7 +384,7 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
     print(f"   SL-Modus: {BASE_STOP_MODE}  → {stop_percentage:.2f}% unter Entry")
     if RUNNER_PCT > 0 and runner_pct is not None:
         print(f"   Runner% ≈ {runner_pct:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
-    print("   DCAs: " + (", ".join([f"{o['quantity_percentage']}%@{o['price']:.6f}" for o in dca_orders]) if dca_orders else "–"))
+    print("   DCAs: " + (", ".join([f\"{o['quantity_percentage']}%@{o['price']:.6f}\" for o in dca_orders]) if dca_orders else "–"))
     return payload
 
 # =========================
@@ -435,9 +436,9 @@ def main():
     print("="*50)
     print("🚀 Discord → Altrady Bot v2.6 (Percent TPs, SL@DCA1 default, Runner)")
     print("="*50)
-    print(f"Exchange #1: {ALTRADY_EXCHANGE} | Leverage: {FIXED_LEVERAGE}x")
+    print(f"Exchange #1: {ALTRADY_EXCHANGE} | Leverage: {LEVERAGE_1}x")
     if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
-        print(f"Exchange #2: {ALTRADY_EXCHANGE_2}")
+        print(f"Exchange #2: {ALTRADY_EXCHANGE_2} | Leverage: {LEVERAGE_2}x")
     print(f"TP-Splits: {TP1_PCT}/{TP2_PCT}/{TP3_PCT}% + Runner {RUNNER_PCT}%")
     print(f"DCAs: D1 {DCA1_QTY_PCT}%, D2 {DCA2_QTY_PCT}%, D3 {DCA3_QTY_PCT}%")
     print(f"Stop: {BASE_STOP_MODE} + Buffer {SL_BUFFER_PCT}%"
@@ -492,12 +493,12 @@ def main():
                         sig = parse_signal_from_text(raw)
                         if sig:
                             # Payload #1
-                            p1 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE, ALTRADY_API_KEY, ALTRADY_API_SECRET)
+                            p1 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE, ALTRADY_API_KEY, ALTRADY_API_SECRET, LEVERAGE_1)
                             jobs = [(ALTRADY_WEBHOOK_URL, p1)]
 
                             # Payload #2 (optional)
                             if ALTRADY_WEBHOOK_URL_2 and ALTRADY_API_KEY_2 and ALTRADY_API_SECRET_2 and ALTRADY_EXCHANGE_2:
-                                p2 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE_2, ALTRADY_API_KEY_2, ALTRADY_API_SECRET_2)
+                                p2 = build_altrady_open_payload(sig, ALTRADY_EXCHANGE_2, ALTRADY_API_KEY_2, ALTRADY_API_SECRET_2, LEVERAGE_2)
                                 jobs.append((ALTRADY_WEBHOOK_URL_2, p2))
 
                             post_to_all_webhooks(jobs)
