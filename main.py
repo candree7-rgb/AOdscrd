@@ -53,6 +53,9 @@ BASE_STOP_MODE         = os.getenv("BASE_STOP_MODE", "DCA1").strip().upper()  # 
 SL_BUFFER_PCT          = float(os.getenv("SL_BUFFER_PCT", "4.0"))
 STOP_FIXED_PERCENTAGE  = float(os.getenv("STOP_FIXED_PERCENTAGE", "9.0"))
 
+# >>> NEU: expliziter Order-Typ für SL (MARKET vs LIMIT)
+STOP_LOSS_ORDER_TYPE   = os.getenv("STOP_LOSS_ORDER_TYPE", "STOP_LOSS_MARKET").strip().upper()
+
 # DCA Größen (% der Start-Positionsgröße)
 DCA1_QTY_PCT        = float(os.getenv("DCA1_QTY_PCT", "150"))
 DCA2_QTY_PCT        = float(os.getenv("DCA2_QTY_PCT", "0"))    # Default: DCA1-only
@@ -360,6 +363,7 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         "entry_condition": { "price": float(f"{trigger_price:.10f}") },
         "take_profit": take_profits,
         "stop_loss": {
+            "order_type": STOP_LOSS_ORDER_TYPE,  # <<— NEU: SL explizit Market/Limit
             "stop_percentage": float(f"{stop_percentage:.6f}"),
             "protection_type": STOP_PROTECTION_TYPE
         },
@@ -384,6 +388,7 @@ def build_altrady_open_payload(sig: dict, exchange: str, api_key: str, api_secre
         + (f" oder Preis {expire_price:.6f}" if expire_price else "")
     )
     print(f"   SL-Modus: {BASE_STOP_MODE}  → {stop_percentage:.2f}% unter Entry")
+    print(f"   SL-Order-Typ: {STOP_LOSS_ORDER_TYPE}")
     if RUNNER_PCT > 0 and runner_pct is not None:
         print(f"   Runner% ≈ {runner_pct:.6f}  |  Trail {RUNNER_TRAILING_DIST:.2f}%")
     print(
@@ -448,6 +453,7 @@ def main():
     print(f"DCAs: D1 {DCA1_QTY_PCT}%, D2 {DCA2_QTY_PCT}%, D3 {DCA3_QTY_PCT}%")
     print(f"Stop: {BASE_STOP_MODE} + Buffer {SL_BUFFER_PCT}%"
           + (f" | FIXED={STOP_FIXED_PERCENTAGE}%" if BASE_STOP_MODE=='FIXED' else ""))
+    print(f"SL-Order-Typ (ENV): {STOP_LOSS_ORDER_TYPE}")
     print(f"Entry: Buffer {ENTRY_TRIGGER_BUFFER_PCT}% | Expire {ENTRY_EXPIRATION_MIN} min"
           + (f" + Preis±{ENTRY_EXPIRATION_PRICE_PCT}%" if ENTRY_EXPIRATION_PRICE_PCT>0 else ""))
     if COOLDOWN_SECONDS > 0:
